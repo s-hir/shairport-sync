@@ -38,15 +38,18 @@
 
 static int fd = -1;
 
-static void start(int sample_rate, int sample_format) { fd = STDOUT_FILENO; }
+static void start(__attribute__((unused)) int sample_rate,
+                  __attribute__((unused)) int sample_format) {
+  fd = STDOUT_FILENO;
+}
 
 static void play(short buf[], int samples) {
   char errorstring[1024];
   int warned = 0;
-  int rc = write(fd, buf, samples * 4); 
-  if ((rc<0) && (warned==0)) {
-    strerror_r(errno,(char*)errorstring,1024);
-    warn("Error %d writing to stdout: \"%s\".",errno,errorstring);
+  int rc = write(fd, buf, samples * 4);
+  if ((rc < 0) && (warned == 0)) {
+    strerror_r(errno, (char *)errorstring, 1024);
+    warn("Error %d writing to stdout: \"%s\".", errno, errorstring);
     warned = 1;
   }
 }
@@ -55,83 +58,14 @@ static void stop(void) {
   // don't close stdout
 }
 
-static int init(int argc, char **argv) {
-  const char *str;
-  int value;
-  double dvalue;
-
+static int init(__attribute__((unused)) int argc, __attribute__((unused)) char **argv) {
+  // set up default values first
   config.audio_backend_buffer_desired_length = 1.0;
   config.audio_backend_latency_offset = 0;
 
-  if (config.cfg != NULL) {
-    /* Get the desired length of the period of silence before the audio starts. */
-    if (config_lookup_float(config.cfg, "stdout.audio_backend_silent_lead_in_time",
-                            &dvalue)) {
-      if ((dvalue < 0.05) || (dvalue > 4)) {
-        die("Invalid stdout audio_backend_silent_lead_in_time \"%f\". It "
-            "must be between 0.050 and 4.0 seconds. Omit setting to use the default value, which is approximately the latency specified by the source (typically 2 seconds). A value greater than the latency is ignored.",
-            dvalue);
-      } else {
-        config.audio_backend_silent_lead_in_time = dvalue;
-      }
-    }
-
-    /* Get the desired buffer size setting. */
-    if (config_lookup_int(config.cfg, "stdout.audio_backend_buffer_desired_length", &value)) {
-      if ((value < 0) || (value > 66150)) {
-        inform("The setting audio_backend_buffer_desired_length is deprecated. "
-               "Use audio_backend_buffer_desired_length_in_seconds instead.");
-        die("Invalid stdout audio backend buffer desired length \"%d\". It "
-            "should be between 0 and "
-            "66150, default is 6615",
-            value);
-      } else {
-        inform("The stdout.setting audio_backend_buffer_desired_length is deprecated. "
-               "Use stdout.audio_backend_buffer_desired_length_in_seconds instead.");
-        config.audio_backend_buffer_desired_length = 1.0 * value / 44100;
-      }
-    }
-
-    /* Get the desired buffer size setting. */
-    if (config_lookup_float(config.cfg, "stdout.audio_backend_buffer_desired_length_in_seconds",
-                            &dvalue)) {
-      if ((dvalue < 0) || (dvalue > 1.5)) {
-        die("Invalid stdout audio backend buffer desired time \"%f\". It "
-            "should be between 0 and "
-            "1.5, default is 0.15 seconds",
-            dvalue);
-      } else {
-        config.audio_backend_buffer_desired_length = dvalue;
-      }
-    }
-
-    /* Get the latency offset. */
-    if (config_lookup_int(config.cfg, "stdout.audio_backend_latency_offset", &value)) {
-      if ((value < -66150) || (value > 66150)) {
-        inform("The setting stdout.audio_backend_latency_offset is deprecated. "
-               "Use stdout.audio_backend_latency_offset_in_seconds instead.");
-        die("Invalid stdout audio backend buffer latency offset \"%d\". It "
-            "should be between -66150 and +66150, default is 0",
-            value);
-      } else {
-        inform("The setting stdout.audio_backend_latency_offset is deprecated. "
-               "Use stdout.audio_backend_latency_offset_in_seconds instead.");
-        config.audio_backend_latency_offset = 1.0 * value / 44100;
-      }
-    }
-
-    /* Get the latency offset. */
-    if (config_lookup_float(config.cfg, "stdout.audio_backend_latency_offset_in_seconds",
-                            &dvalue)) {
-      if ((dvalue < -1.0) || (dvalue > 1.5)) {
-        die("Invalid stdout audio backend buffer latency offset time \"%f\". It "
-            "should be between -1.0 and +1.5, default is 0 seconds",
-            dvalue);
-      } else {
-        config.audio_backend_latency_offset = dvalue;
-      }
-    }
-  }
+  // get settings from settings file
+  // do the "general" audio  options. Note, these options are in the "general" stanza!
+  parse_general_audio_options();
   return 0;
 }
 
