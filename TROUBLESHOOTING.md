@@ -4,7 +4,9 @@ The installation and setup of Shairport Sync is straightforward on recent Linux 
 
 In this brief document will be listed some problems and some solutions, some provided by other users.
 
-Before starting, ensure that your software is up-to-date. 
+1. Before starting, ensure that your software is up-to-date.
+2. Set the `interpolation` in the `general` section of the configuration file to `basic` as the `soxr` setting can cause lower-powered devices to bog down at critical times, e.g. see [this report](https://github.com/mikebrady/shairport-sync/issues/631#issuecomment-366305203).
+
 
 ### WiFi adapter running in power-saving / low-power mode
 
@@ -46,7 +48,7 @@ Allow network discovery. This setting creates a private type network and enables
 
 **Problem**
 
-You have installed Shairport Sync successfully, the deamon is running, you can see it from your remote terminal but you are unable to play a song.
+You have installed Shairport Sync successfully, the daemon is running, you can see it from your remote terminal but you are unable to play a song.
 
 **Before you change anything to your configuration**
 
@@ -72,11 +74,62 @@ sudo ufw allow from 192.168.1.1/16 to any port 6000:6005 proto udp
 sudo ufw allow from 192.168.1.1/16 to any port 35000:65535 proto udp
 ```
 
-You may have to change the IP adresses range depending on your own local network settings.
+You may have to change the IP addresses range depending on your own local network settings.
 
 You can check UFW config by typing `sudo ufw status` in shell. Please make sure that UFW is active, especially if you have deactivated it previously for testing purpose.
 
 Run your song from your remote device. Enjoy !
+
+### Shairport Sync Won't Start Automatically After Reboot
+This refers to slower machines, such as the Raspberry Pi Zero or the original (single core) Raspberry Pi, running a recent Linux that uses `systemd`.
+
+**Problem**
+
+Having compiled Shairport Sync properly using the README guide, and having completed the `make install` step, and having enabled startup on reboot using `$ sudo systemctl enable shairport-sync`, Shairport Sync will start manually upon entering `$sudo systemctl enable shairport-sync`, but it will not start automatically after a reboot.
+
+**Possible Cause**
+
+On lower-powered machines, such as the Raspberry Pi Zero or the original (single core) Raspberry Pi, particularly with a USB sound card, it may be that the sound system is not ready when Shairport Sync is automatically started. The result is that Shairport Sync cannot see the device it needs and shuts down.
+
+**Possible Solution**
+
+A good solution is to delay the automatic startup of Shairport Sync by a few seconds using the `systemd` timer mechanism:
+
+Create a file called `shairport-sync.timer` and place it alongside `shairport-sync.service` in `/lib/systemd/system`. The file should contain the following:
+```
+[Unit]
+Description=Shairport Sync AirPlay receiver
+
+[Timer]                       
+OnBootSec=10s              
+Unit=shairport-sync.service
+
+[Install]    
+WantedBy=multi-user.target  
+```
+You need to disable the `shairport-sync` service because the timer is calling the service, and you need to enable the `shairport-sync` timer:
+
+```
+# systemctl disable shairport-sync
+# systemctl start shairport-sync.timer
+# systemctl enable shairport-sync.timer
+```
+See also #179, with thanks to @maumi and others.
+
+**Alternative Solution**
+
+- Edit Shairport Sync service file `sudo nano /lib/systemd/system/shairport-sync.service`
+- Update the service section to include the line `ExecStartPre=/bin/sleep 5`
+
+Example:
+
+```
+[Service]
+ExecStartPre=/bin/sleep 5
+ExecStart=/usr/local/bin/shairport-sync
+User=pi
+Group=pi
+```
 
 ### Stuttering audio on certain USB DACs (such as the Creative Soundblaster MP3+)
 
@@ -152,6 +205,6 @@ This sets the default alsa audio device to be the USB DAC via a dmixer plugin (w
 
 This will then be used by default by Shairport-Sync and any other applications using alsa. 
 
-Note that some distributions (such as Volumio 2) don't use an asound.conf file by default, they instead specificy the hardware details directly in '/etc/mpd.conf' files so some more in-depth modification is needed to override this.
+Note that some distributions (such as Volumio 2) don't use an asound.conf file by default, they instead specify the hardware details directly in '/etc/mpd.conf' files so some more in-depth modification is needed to override this.
 
 (Note: not tested by Mike B.)

@@ -2,7 +2,7 @@
  * Shairport, an Apple Airplay receiver
  * Copyright (c) James Laird 2013
  * All rights reserved.
- * Modifications (c) Mike Brady 2014--2017
+ * Modifications (c) Mike Brady 2014--2018
  *
  * Permission is hereby granted, free of charge, to any person
  * obtaining a copy of this software and associated documentation
@@ -31,9 +31,9 @@
 #include <libconfig.h>
 #include <libgen.h>
 #include <memory.h>
+#include <sys/socket.h>
 #include <net/if.h>
 #include <popt.h>
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/stat.h>
@@ -55,6 +55,22 @@
 #include <openssl/md5.h>
 #endif
 
+#if defined(HAVE_DBUS)
+#include <glib.h>
+#endif
+
+#if defined(HAVE_DBUS) || defined(HAVE_MPRIS)
+#include "dacp.h"
+#endif
+
+#ifdef HAVE_DBUS
+#include "dbus-service.h"
+#endif
+
+#ifdef HAVE_MPRIS
+#include "mpris-service.h"
+#endif
+
 #include "common.h"
 #include "mdns.h"
 #include "rtp.h"
@@ -66,8 +82,11 @@
 #include <libdaemon/dpid.h>
 #include <libdaemon/dsignal.h>
 
+#ifdef CONFIG_CONVOLUTION
+#include <FFTConvolver/convolver.h>
+#endif
+
 static int shutting_down = 0;
-static char *appName = NULL;
 char configuration_file_path[4096 + 1];
 char actual_configuration_file_path[4096 + 1];
 
@@ -110,6 +129,54 @@ static void sig_connect_audio_output(int foo, siginfo_t *bar, void *baz) {
   set_requested_connection_state_to_output(1);
 }
 
+// The following two functions are adapted slightly and with thanks from Jonathan Leffler's sample
+// code at
+// https://stackoverflow.com/questions/675039/how-can-i-create-directory-tree-in-c-linux
+
+int do_mkdir(const char *path, mode_t mode) {
+  struct stat st;
+  int status = 0;
+
+  if (stat(path, &st) != 0) {
+    /* Directory does not exist. EEXIST for race condition */
+    if (mkdir(path, mode) != 0 && errno != EEXIST)
+      status = -1;
+  } else if (!S_ISDIR(st.st_mode)) {
+    errno = ENOTDIR;
+    status = -1;
+  }
+
+  return (status);
+}
+
+// mkpath - ensure all directories in path exist
+// Algorithm takes the pessimistic view and works top-down to ensure
+// each directory in path exists, rather than optimistically creating
+// the last element and working backwards.
+
+int mkpath(const char *path, mode_t mode) {
+  char *pp;
+  char *sp;
+  int status;
+  char *copypath = strdup(path);
+
+  status = 0;
+  pp = copypath;
+  while (status == 0 && (sp = strchr(pp, '/')) != 0) {
+    if (sp != pp) {
+      /* Neither root nor double slash in path */
+      *sp = '\0';
+      status = do_mkdir(copypath, mode);
+      *sp = '/';
+    }
+    pp = sp + 1;
+  }
+  if (status == 0)
+    status = do_mkdir(path, mode);
+  free(copypath);
+  return (status);
+}
+
 char *get_version_string() {
   char *version_string = malloc(200);
   if (version_string) {
@@ -141,8 +208,8 @@ char *get_version_string() {
 #ifdef CONFIG_AO
     strcat(version_string, "-ao");
 #endif
-#ifdef CONFIG_PULSE
-    strcat(version_string, "-pulse");
+#ifdef CONFIG_PA
+    strcat(version_string, "-pa");
 #endif
 #ifdef CONFIG_SOUNDIO
     strcat(version_string, "-soundio");
@@ -159,8 +226,17 @@ char *get_version_string() {
 #ifdef HAVE_LIBSOXR
     strcat(version_string, "-soxr");
 #endif
+#ifdef CONFIG_CONVOLUTION
+    strcat(version_string, "-convolution");
+#endif
 #ifdef CONFIG_METADATA
     strcat(version_string, "-metadata");
+#endif
+#ifdef HAVE_DBUS
+    strcat(version_string, "-dbus");
+#endif
+#ifdef HAVE_MPRIS
+    strcat(version_string, "-mpris");
 #endif
     strcat(version_string, "-sysconfdir:");
     strcat(version_string, SYSCONFDIR);
@@ -185,6 +261,7 @@ void usage(char *progname) {
   printf("Options:\n");
   printf("    -h, --help              show this help.\n");
   printf("    -d, --daemon            daemonise.\n");
+  printf("    -j, --justDaemoniseNoPIDFile            daemonise without a PID file.\n");
   printf("    -V, --version           show version information.\n");
   printf("    -k, --kill              kill the existing shairport daemon.\n");
   printf("    -D, --disconnectFromOutput  disconnect immediately from the output device.\n");
@@ -193,7 +270,7 @@ void usage(char *progname) {
          "/etc/shairport-sync.conf.\n");
 
   printf("\n");
-  printf("The following general options are for backward compatability. These and all new options "
+  printf("The following general options are for backward compatibility. These and all new options "
          "have settings in the configuration file, by default /etc/shairport-sync.conf:\n");
   printf("    -v, --verbose           -v print debug information; -vv more; -vvv lots.\n");
   printf("    -p, --port=PORT         set RTSP listening port.\n");
@@ -243,6 +320,8 @@ void usage(char *progname) {
          "88) before trying to correct it.\n");
   printf("    --password=PASSWORD     require PASSWORD to connect. Default is not to require a "
          "password.\n");
+  printf("    --logOutputLevel        log the output level setting -- useful for setting maximum "
+         "volume.\n");
 #ifdef CONFIG_METADATA
   printf("    --metadata-pipename=PIPE send metadata to PIPE, e.g. "
          "--metadata-pipename=/tmp/shairport-sync-metadata.\n");
@@ -265,14 +344,18 @@ int parse_options(int argc, char **argv) {
   int fResyncthreshold = (int)(config.resyncthreshold * 44100);
   int fTolerance = (int)(config.tolerance * 44100);
   poptContext optCon; /* context for parsing command-line options */
+  int daemonisewith = 0;
+  int daemonisewithout = 0;
   struct poptOption optionsTable[] = {
       {"verbose", 'v', POPT_ARG_NONE, NULL, 'v', NULL},
       {"disconnectFromOutput", 'D', POPT_ARG_NONE, NULL, 0, NULL},
       {"reconnectToOutput", 'R', POPT_ARG_NONE, NULL, 0, NULL},
       {"kill", 'k', POPT_ARG_NONE, NULL, 0, NULL},
-      {"daemon", 'd', POPT_ARG_NONE, &config.daemonise, 0, NULL},
+      {"daemon", 'd', POPT_ARG_NONE, &daemonisewith, 0, NULL},
+      {"justDaemoniseNoPIDFile", 'j', POPT_ARG_NONE, &daemonisewithout, 0, NULL},
       {"configfile", 'c', POPT_ARG_STRING, &config.configfile, 0, NULL},
       {"statistics", 0, POPT_ARG_NONE, &config.statistics_requested, 0, NULL},
+      {"logOutputLevel", 0, POPT_ARG_NONE, &config.logOutputLevel, 0, NULL},
       {"version", 'V', POPT_ARG_NONE, NULL, 0, NULL},
       {"port", 'p', POPT_ARG_INT, &config.port, 0, NULL},
       {"name", 'a', POPT_ARG_STRING, &raw_service_name, 0, NULL},
@@ -346,15 +429,26 @@ int parse_options(int argc, char **argv) {
     die("%s: %s", poptBadOption(optCon, POPT_BADOPTION_NOALIAS), poptStrerror(c));
   }
 
+  if ((daemonisewith) && (daemonisewithout))
+    die("Select either daemonize_with_pid_file or daemonize_without_pid_file -- you have selected "
+        "both!");
+  if ((daemonisewith) || (daemonisewithout)) {
+    config.daemonise = 1;
+    if (daemonisewith)
+      config.daemonise_store_pid = 1;
+  };
+
   config.resyncthreshold = 1.0 * fResyncthreshold / 44100;
   config.tolerance = 1.0 * fTolerance / 44100;
-
+  config.audio_backend_silent_lead_in_time = -1.0; // flag to indicate it has not been set
+  config.airplay_volume = -18.0; // if no volume is ever set, default to initial default value if nothing else comes in first.
+  
   config_setting_t *setting;
   const char *str = 0;
   int value = 0;
   double dvalue = 0.0;
 
-  debug(1, "Looking for the configuration file \"%s\".", config.configfile);
+  // debug(1, "Looking for the configuration file \"%s\".", config.configfile);
 
   config_init(&config_file_stuff);
 
@@ -371,16 +465,40 @@ int parse_options(int argc, char **argv) {
       if (config_lookup_string(config.cfg, "general.name", &str)) {
         raw_service_name = (char *)str;
       }
-
+      int daemonisewithout = 0;
+      int daemonisewith = 0;
       /* Get the Daemonize setting. */
-      if (config_lookup_string(config.cfg, "general.daemonize", &str)) {
+      if (config_lookup_string(config.cfg, "sessioncontrol.daemonize_with_pid_file", &str)) {
         if (strcasecmp(str, "no") == 0)
-          config.daemonise = 0;
+          daemonisewith = 0;
         else if (strcasecmp(str, "yes") == 0)
-          config.daemonise = 1;
+          daemonisewith = 1;
         else
-          die("Invalid daemonize option choice \"%s\". It should be \"yes\" or \"no\"");
+          die("Invalid daemonize_with_pid_file option choice \"%s\". It should be \"yes\" or "
+              "\"no\"");
       }
+
+      /* Get the Just_Daemonize setting. */
+      if (config_lookup_string(config.cfg, "sessioncontrol.daemonize_without_pid_file", &str)) {
+        if (strcasecmp(str, "no") == 0)
+          daemonisewithout = 0;
+        else if (strcasecmp(str, "yes") == 0)
+          daemonisewithout = 1;
+        else
+          die("Invalid daemonize_without_pid_file option choice \"%s\". It should be \"yes\" or "
+              "\"no\"");
+      }
+      if ((daemonisewith) && (daemonisewithout))
+        die("Select either daemonize_with_pid_file or daemonize_without_pid_file -- you have "
+            "selected both!");
+      if ((daemonisewith) || (daemonisewithout)) {
+        config.daemonise = 1;
+        if (daemonisewith)
+          config.daemonise_store_pid = 1;
+      }
+      /* Get the directory path for the pid file created when the program is daemonised. */
+      if (config_lookup_string(config.cfg, "sessioncontrol.daemon_pid_dir", &str))
+        config.piddir = (char *)str;
 
       /* Get the mdns_backend setting. */
       if (config_lookup_string(config.cfg, "general.mdns_backend", &str))
@@ -426,9 +544,15 @@ int parse_options(int argc, char **argv) {
         if (strcasecmp(str, "basic") == 0)
           config.packet_stuffing = ST_basic;
         else if (strcasecmp(str, "soxr") == 0)
+#ifdef HAVE_LIBSOXR
           config.packet_stuffing = ST_soxr;
+#else
+          die("The soxr option not available because this version of shairport-sync was built "
+              "without libsoxr "
+              "support. Change the \"general/interpolation\" setting in the configuration file.");
+#endif
         else
-          die("Invalid interpolation option choice \"%s\". It should be \"basic\" or \"soxr\"");
+          die("Invalid interpolation option choice. It should be \"basic\" or \"soxr\"");
       }
 
       /* Get the statistics setting. */
@@ -485,9 +609,13 @@ int parse_options(int argc, char **argv) {
 
       /* Get the optional volume_max_db setting. */
       if (config_lookup_float(config.cfg, "general.volume_max_db", &dvalue)) {
-        debug(1, "Max volume setting of %f dB", dvalue);
+        // debug(1, "Max volume setting of %f dB", dvalue);
         config.volume_max_db = dvalue;
         config.volume_max_db_set = 1;
+      }
+
+      if (config_lookup_string(config.cfg, "general.run_this_when_volume_is_set", &str)) {
+        config.cmd_set_volume = (char *)str;
       }
 
       /* Get the playback_mode setting */
@@ -645,6 +773,18 @@ int parse_options(int argc, char **argv) {
               "\"yes\" or \"no\"");
       }
 
+      if (config_lookup_string(config.cfg, "sessioncontrol.before_play_begins_returns_output",
+                               &str)) {
+        if (strcasecmp(str, "no") == 0)
+          config.cmd_start_returns_output = 0;
+        else if (strcasecmp(str, "yes") == 0)
+          config.cmd_start_returns_output = 1;
+        else
+          die("Invalid session control before_play_begins_returns_output option choice \"%s\". It "
+              "should be "
+              "\"yes\" or \"no\"");
+      }
+
       if (config_lookup_string(config.cfg, "sessioncontrol.allow_session_interruption", &str)) {
         config.dont_check_timeout = 0; // this is for legacy -- only set by -t 0
         if (strcasecmp(str, "no") == 0)
@@ -662,6 +802,64 @@ int parse_options(int argc, char **argv) {
         config.dont_check_timeout = 0; // this is for legacy -- only set by -t 0
       }
 
+#ifdef CONFIG_CONVOLUTION
+
+      if (config_lookup_string(config.cfg, "dsp.convolution", &str)) {
+        if (strcasecmp(str, "no") == 0)
+          config.convolution = 0;
+        else if (strcasecmp(str, "yes") == 0)
+          config.convolution = 1;
+        else
+          die("Invalid dsp.convolution. It should be \"yes\" or \"no\"");
+      }
+
+      if (config_lookup_float(config.cfg, "dsp.convolution_gain", &dvalue)) {
+        config.convolution_gain = dvalue;
+        if (dvalue > 10 || dvalue < -50)
+          die("Invalid value \"%f\" for dsp.convolution_gain. It should be between -50 and +10 dB",
+              dvalue);
+      }
+
+      config.convolution_max_length = 8192;
+      if (config_lookup_int(config.cfg, "dsp.convolution_max_length", &value)) {
+        config.convolution_max_length = value;
+
+        if (value < 1 || value > 200000)
+          die("dsp.convolution_max_length must be within 1 and 200000");
+      }
+
+      if (config_lookup_string(config.cfg, "dsp.convolution_ir_file", &str)) {
+        config.convolution_ir_file = str;
+        convolver_init(config.convolution_ir_file, config.convolution_max_length);
+      }
+
+      if (config.convolution && config.convolution_ir_file == NULL) {
+        die("Convolution enabled but no convolution_ir_file provided");
+      }
+#endif
+
+      if (config_lookup_string(config.cfg, "dsp.loudness", &str)) {
+        if (strcasecmp(str, "no") == 0)
+          config.loudness = 0;
+        else if (strcasecmp(str, "yes") == 0)
+          config.loudness = 1;
+        else
+          die("Invalid dsp.convolution. It should be \"yes\" or \"no\"");
+      }
+
+      config.loudness_reference_volume_db = -20;
+      if (config_lookup_float(config.cfg, "dsp.loudness_reference_volume_db", &dvalue)) {
+        config.loudness_reference_volume_db = dvalue;
+        if (dvalue > 0 || dvalue < -100)
+          die("Invalid value \"%f\" for dsp.loudness_reference_volume_db. It should be between "
+              "-100 and 0",
+              dvalue);
+      }
+
+      if (config.loudness == 1 && config_lookup_string(config.cfg, "alsa.mixer_control_name", &str))
+        die("Loudness activated but hardware volume is active. You must remove "
+            "\"alsa.mixer_control_name\" to use the loudness filter.");
+
     } else {
       if (config_error_type(&config_file_stuff) == CONFIG_ERR_FILE_IO)
         debug(1, "Error reading configuration file \"%s\": \"%s\".",
@@ -671,6 +869,32 @@ int parse_options(int argc, char **argv) {
             config_error_file(&config_file_stuff), config_error_text(&config_file_stuff));
       }
     }
+#if defined(HAVE_DBUS)
+    /* Get the dbus service sbus setting. */
+    if (config_lookup_string(config.cfg, "general.dbus_service_bus", &str)) {
+      if (strcasecmp(str, "system") == 0)
+        config.dbus_service_bus_type = DBT_system;
+      else if (strcasecmp(str, "session") == 0)
+        config.dbus_service_bus_type = DBT_session;
+      else
+        die("Invalid dbus_service_bus option choice \"%s\". It should be \"system\" (default) or "
+            "\"session\"");
+    }
+#endif
+
+#if defined(HAVE_MPRIS)
+    /* Get the mpris service sbus setting. */
+    if (config_lookup_string(config.cfg, "general.mpris_service_bus", &str)) {
+      if (strcasecmp(str, "system") == 0)
+        config.mpris_service_bus_type = DBT_system;
+      else if (strcasecmp(str, "session") == 0)
+        config.mpris_service_bus_type = DBT_session;
+      else
+        die("Invalid mpris_service_bus option choice \"%s\". It should be \"system\" (default) or "
+            "\"session\"");
+    }
+#endif
+
     free(config_file_real_path);
   }
 
@@ -718,8 +942,9 @@ int parse_options(int argc, char **argv) {
 #ifdef HAVE_LIBSOXR
         config.packet_stuffing = ST_soxr;
 #else
-        die("soxr option not available -- this version of shairport-sync was built without libsoxr "
-            "support");
+        die("The soxr option not available because this version of shairport-sync was built "
+            "without libsoxr "
+            "support. Change the -S option setting.");
 #endif
       else
         die("Illegal stuffing option \"%s\" -- must be \"basic\" or \"soxr\"", stuffing);
@@ -762,8 +987,31 @@ int parse_options(int argc, char **argv) {
   free(i3);
   free(vs);
 
+// now, check and calculate the pid directory
+#ifdef USE_CUSTOM_PID_DIR
+  char *use_this_pid_dir = PIDDIR;
+#else
+  char *use_this_pid_dir = "/var/run/shairport-sync";
+#endif
+  // debug(1,"config.piddir \"%s\".",config.piddir);
+  if (config.piddir)
+    use_this_pid_dir = config.piddir;
+  if (use_this_pid_dir)
+    config.computed_piddir = strdup(use_this_pid_dir);
+
   return optind + 1;
 }
+
+#if defined(HAVE_DBUS) || defined(HAVE_MPRIS)
+GMainLoop *loop;
+
+pthread_t dbus_thread;
+void *dbus_thread_func(void *arg) {
+  loop = g_main_loop_new(NULL, FALSE);
+  g_main_loop_run(loop);
+  return NULL;
+}
+#endif
 
 void signal_setup(void) {
   // mask off all signals before creating threads.
@@ -778,6 +1026,10 @@ void signal_setup(void) {
   sigdelset(&set, SIGCHLD);
   sigdelset(&set, SIGUSR2);
   pthread_sigmask(SIG_BLOCK, &set, NULL);
+
+  // SIGUSR1 is used to interrupt a thread if blocked in pselect
+  pthread_sigmask(SIG_SETMASK, NULL, &pselect_sigset);
+  sigdelset(&pselect_sigset, SIGUSR1);
 
   // setting this to SIG_IGN would prevent signalling any threads.
   struct sigaction sa;
@@ -809,25 +1061,21 @@ void shairport_startup_complete(void) {
   }
 }
 
-#ifdef USE_CUSTOM_PID_DIR
-
 const char *pid_file_proc(void) {
-#ifdef HAVE_ASPRINTF
-  static char *fn = NULL;
-  asprintf(&fn, "%s/%s.pid", PIDDIR, daemon_pid_file_ident ? daemon_pid_file_ident : "unknown");
-#else
-  static char fn[8192];
-  snprintf(fn, sizeof(fn), "%s/%s.pid", PIDDIR,
-           daemon_pid_file_ident ? daemon_pid_file_ident : "unknown");
-#endif
 
-  return fn;
+  char fn[8192];
+  snprintf(fn, sizeof(fn), "%s/%s.pid", config.computed_piddir,
+           daemon_pid_file_ident ? daemon_pid_file_ident : "unknown");
+  // debug(1,"fn \"%s\".",fn);
+  return strdup(fn);
 }
-#endif
 
 void exit_function() {
+  // debug(1, "exit function called...");
   if (config.cfg)
     config_destroy(config.cfg);
+  if (config.appName)
+    free(config.appName);
   // probably should be freeing malloc'ed memory here, including strdup-created strings...
 }
 
@@ -840,7 +1088,9 @@ int main(int argc, char **argv) {
   // this is a bit weird, but apparently necessary
   char *basec = strdup(argv[0]);
   char *bname = basename(basec);
-  appName = strdup(bname);
+  config.appName = strdup(bname);
+  if (config.appName == NULL)
+    die("can not allocate memory for the app name!");
   free(basec);
 
   // set defaults
@@ -865,9 +1115,14 @@ int main(int argc, char **argv) {
   else
     die("Can not recognise the endianness of the processor.");
 
+  // set non-zero / non-NULL default values here
+  // but note that audio back ends also have a chance to set defaults
+
   strcpy(configuration_file_path, SYSCONFDIR);
+  // strcat(configuration_file_path, "/shairport-sync"); // thinking about adding a special
+  // shairport-sync directory
   strcat(configuration_file_path, "/");
-  strcat(configuration_file_path, appName);
+  strcat(configuration_file_path, config.appName);
   strcat(configuration_file_path, ".conf");
   config.configfile = configuration_file_path;
 
@@ -941,11 +1196,10 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-#if USE_CUSTOM_PID_DIR
-  debug(1, "Locating custom pid dir at \"%s\"", PIDDIR);
-  /* Point to a function to help locate where the PID file will go */
+  // Point to a function to help locate where the PID file will go
+  // We always use this function because the default location
+  // is unsatisfactory. By default we want to use /var/run/shairport-sync/.
   daemon_pid_file_proc = pid_file_proc;
-#endif
 
   /* Set indentification string for the daemon for both syslog and PID file */
   daemon_pid_file_ident = daemon_log_ident = daemon_ident_from_argv0(argv[0]);
@@ -983,6 +1237,9 @@ int main(int argc, char **argv) {
     exit(1);
   }
 
+  // parse arguments into config -- needed to locate pid_dir
+  int audio_arg = parse_options(argc, argv);
+
   /* Check if we are called with -k or --kill parameter */
   if (argc >= 2 && ((strcmp(argv[1], "-k") == 0) || (strcmp(argv[1], "--kill") == 0))) {
     int ret;
@@ -996,14 +1253,11 @@ int main(int argc, char **argv) {
     return ret < 0 ? 1 : 0;
   }
 
-  /* Check that the daemon is not running twice at the same time */
-  if ((pid = daemon_pid_file_is_running()) >= 0) {
+  /* If we are going to daemonise, check that the daemon is not running already.*/
+  if ((config.daemonise) && ((pid = daemon_pid_file_is_running()) >= 0)) {
     daemon_log(LOG_ERR, "Daemon already running on PID file %u", pid);
     return 1;
   }
-
-  // parse arguments into config
-  int audio_arg = parse_options(argc, argv);
 
   // mDNS supports maximum of 63-character names (we append 13).
   if (strlen(config.service_name) > 50) {
@@ -1037,10 +1291,23 @@ int main(int argc, char **argv) {
         return 255;
       }
 
-      if (ret != 0)
-        daemon_log(ret != 0 ? LOG_ERR : LOG_INFO, "Daemon returned %i as return value.", ret);
+      switch (ret) {
+      case 0:
+        break;
+      case 1:
+        daemon_log(LOG_ERR,
+                   "daemon failed to launch: could not close open file descriptors after forking.");
+        break;
+      case 2:
+        daemon_log(LOG_ERR, "daemon failed to launch: could not create PID file.");
+        break;
+      case 3:
+        daemon_log(LOG_ERR, "daemon failed to launch: could not create or access PID directory.");
+        break;
+      default:
+        daemon_log(LOG_ERR, "daemon failed to launch, error %i.", ret);
+      }
       return ret;
-
     } else { /* The daemon */
 
       /* Close FDs */
@@ -1052,11 +1319,21 @@ int main(int argc, char **argv) {
         goto finish;
       }
 
-      /* Create the PID file */
-      if (daemon_pid_file_create() < 0) {
-        daemon_log(LOG_ERR, "Could not create PID file (%s).", strerror(errno));
-        daemon_retval_send(2);
-        goto finish;
+      /* Create the PID file if required */
+      if (config.daemonise_store_pid) {
+        /* Create the PID directory if required -- we don't really care about the result */
+        printf("PID directory is \"%s\".", config.computed_piddir);
+        int result = mkpath(config.computed_piddir, 0700);
+        if ((result != 0) && (result != -EEXIST)) {
+          // error creating or accessing the PID file directory
+          daemon_retval_send(3);
+          goto finish;
+        }
+        if (daemon_pid_file_create() < 0) {
+          daemon_log(LOG_ERR, "Could not create PID file (%s).", strerror(errno));
+          daemon_retval_send(2);
+          goto finish;
+        }
       }
 
       /* Send OK to parent process */
@@ -1159,17 +1436,18 @@ int main(int argc, char **argv) {
   }
 
   /* Print out options */
-
   debug(1, "statistics_requester status is %d.", config.statistics_requested);
   debug(1, "daemon status is %d.", config.daemonise);
+  debug(1, "deamon pid file is \"%s\".", pid_file_proc());
   debug(1, "rtsp listening port is %d.", config.port);
   debug(1, "udp base port is %d.", config.udp_port_base);
   debug(1, "udp port range is %d.", config.udp_port_range);
-  debug(1, "Shairport Sync player name is \"%s\".", config.service_name);
-  debug(1, "Audio Output name is \"%s\".", config.output_name);
+  debug(1, "player name is \"%s\".", config.service_name);
+  debug(1, "backend is \"%s\".", config.output_name);
   debug(1, "on-start action is \"%s\".", config.cmd_start);
   debug(1, "on-stop action is \"%s\".", config.cmd_stop);
   debug(1, "wait-cmd status is %d.", config.cmd_blocking);
+  debug(1, "on-start returns output is %d.", config.cmd_start_returns_output);
   debug(1, "mdns backend \"%s\".", config.mdns_name);
   debug(2, "userSuppliedLatency is %d.", config.userSuppliedLatency);
   debug(2, "AirPlayLatency is %d.", config.AirPlayLatency);
@@ -1197,11 +1475,14 @@ int main(int argc, char **argv) {
   debug(1, "audio backend desired buffer length is %f seconds.",
         config.audio_backend_buffer_desired_length);
   debug(1, "audio backend latency offset is %f seconds.", config.audio_backend_latency_offset);
+  debug(1, "audio backend silence lead-in time is %f seconds. A value -1.0 means use the default.",
+        config.audio_backend_silent_lead_in_time);
   debug(1, "volume range in dB (zero means use the range specified by the mixer): %u.",
         config.volume_range_db);
   debug(1, "zeroconf regtype is \"%s\".", config.regtype);
   debug(1, "decoders_supported field is %d.", config.decoders_supported);
   debug(1, "use_apple_decoder is %d.", config.use_apple_decoder);
+  debug(1, "alsa_use_playback_switch_for_mute is %d.", config.alsa_use_playback_switch_for_mute);
   if (config.interface)
     debug(1, "mdns service interface \"%s\" requested.", config.interface);
   else
@@ -1215,13 +1496,22 @@ int main(int argc, char **argv) {
     debug(1, "configuration file name \"%s\" can not be resolved.", config.configfile);
   }
 #ifdef CONFIG_METADATA
-  debug(1, "metdata enabled is %d.", config.metadata_enabled);
+  debug(1, "metadata enabled is %d.", config.metadata_enabled);
   debug(1, "metadata pipename is \"%s\".", config.metadata_pipename);
   debug(1, "metadata socket address is \"%s\" port %d.", config.metadata_sockaddr,
         config.metadata_sockport);
   debug(1, "metadata socket packet size is \"%d\".", config.metadata_sockmsglength);
   debug(1, "get-coverart is %d.", config.get_coverart);
 #endif
+
+#ifdef CONFIG_CONVOLUTION
+  debug(1, "convolution is %d.", config.convolution);
+  debug(1, "convolution IR file is \"%s\"", config.convolution_ir_file);
+  debug(1, "convolution max length %d", config.convolution_max_length);
+  debug(1, "convolution gain is %f", config.convolution_gain);
+#endif
+  debug(1, "loudness is %d.", config.loudness);
+  debug(1, "loudness reference level is %f", config.loudness_reference_volume_db);
 
   uint8_t ap_md5[16];
 
@@ -1249,6 +1539,24 @@ int main(int argc, char **argv) {
 #ifdef CONFIG_METADATA
   metadata_init(); // create the metadata pipe if necessary
 #endif
+
+#if defined(HAVE_DBUS) || defined(HAVE_MPRIS)
+  debug(1,"Requesting DACP Monitor");
+  dacp_monitor_start();
+#endif
+
+#if defined(HAVE_DBUS) || defined(HAVE_MPRIS)
+  // Start up DBUS services after initial settings are all made
+  debug(1, "Starting up D-Bus services");
+  pthread_create(&dbus_thread, NULL, &dbus_thread_func, NULL);
+#ifdef HAVE_DBUS
+  start_dbus_service();
+#endif
+#ifdef HAVE_MPRIS
+  start_mpris_service();
+#endif
+#endif
+
   daemon_log(LOG_INFO, "Successful Startup");
   rtsp_listen_loop();
 

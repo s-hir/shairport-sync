@@ -2,26 +2,14 @@
 #define _COMMON_H
 
 #include <libconfig.h>
+#include <signal.h>
 #include <stdint.h>
 #include <sys/socket.h>
 
 #include "audio.h"
 #include "config.h"
+#include "definitions.h"
 #include "mdns.h"
-
-#if defined(__APPLE__) && defined(__MACH__)
-/* Apple OSX and iOS (Darwin). ------------------------------ */
-#include <TargetConditionals.h>
-#if TARGET_OS_MAC == 1
-/* OSX */
-#define COMPILE_FOR_OSX 1
-#endif
-#endif
-
-#if defined(__linux__) || defined(__FreeBSD__) || defined(__CYGWIN__)
-/* Linux and FreeBSD */
-#define COMPILE_FOR_LINUX_AND_FREEBSD_AND_CYGWIN 1
-#endif
 
 // struct sockaddr_in6 is bigger than struct sockaddr. derp
 #ifdef AF_INET6
@@ -32,6 +20,13 @@
 #define SAFAMILY sa_family
 #endif
 
+#if defined(HAVE_DBUS) || defined(HAVE_MPRIS)
+enum dbus_session_type {
+  DBT_system = 0, // use the session bus
+  DBT_session,    // use the system bus
+} dbt_type;
+#endif
+
 enum endian_type {
   SS_LITTLE_ENDIAN = 0,
   SS_PDP_ENDIAN,
@@ -39,9 +34,9 @@ enum endian_type {
 } endian_type;
 
 enum stuffing_type {
-  ST_basic = 0,
-  ST_soxr,
-} type;
+  ST_basic = 0, // straight deletion or insertion of a frame in a 352-frame packet
+  ST_soxr,      // use libsoxr to make a 352 frame packet one frame longer or shorter
+} s_type;
 
 enum playback_mode_type {
   ST_stereo = 0,
@@ -56,7 +51,8 @@ enum decoders_supported_type {
   decoder_apple_alac,
 } decoders_supported_type;
 
-// the following enum must _exactly match the snd_pcm_format_t definition in the alsa pcm.h file.
+// the following enum is for the formats recognised -- currently only S16LE is recognised for input,
+// so these are output only for the present
 
 enum sps_format_t {
   SPS_FORMAT_UNKNOWN = 0,
@@ -71,9 +67,16 @@ enum sps_format_t {
 
 typedef struct {
   config_t *cfg;
+  double airplay_volume; // stored here for reloading when necessary
+  char *appName; // normally the app is called shairport-syn, but it may be symlinked
   char *password;
   char *service_name; // the name for the shairport service, e.g. "Shairport Sync Version %v running
                       // on host %h"
+#ifdef CONFIG_PA
+  char *pa_application_name; // the name under which Shairport Sync shows up as an "Application" in
+                             // the Sound Preferences in most desktop Linuxes.
+// Defaults to "Shairport Sync". Shairport Sync must be playing to see it.
+#endif
 #ifdef CONFIG_METADATA
   int metadata_enabled;
   char *metadata_pipename;
@@ -110,10 +113,14 @@ typedef struct {
   int64_t AirPlayLatency;      // supplied with --AirPlayLatency option
   int64_t ForkedDaapdLatency;  // supplied with --ForkedDaapdLatency option
   int daemonise;
+  int daemonise_store_pid; // don't try to save a PID file
+  char *piddir;
+  char *computed_piddir; // the actual pid directory to create, if any
+  int logOutputLevel;    // log output level
   int statistics_requested, use_negotiated_latencies;
   enum playback_mode_type playback_mode;
-  char *cmd_start, *cmd_stop;
-  int cmd_blocking;
+  char *cmd_start, *cmd_stop, *cmd_set_volume;
+  int cmd_blocking, cmd_start_returns_output;
   double tolerance; // allow this much drift before attempting to correct it
   enum stuffing_type packet_stuffing;
   int decoders_supported;
@@ -131,10 +138,29 @@ typedef struct {
                                               // audio backend buffer -- the DAC buffer for ALSA
   double audio_backend_latency_offset; // this will be the offset in seconds to compensate for any
                                        // fixed latency there might be in the audio path
+  double audio_backend_silent_lead_in_time; // the length of the silence that should precede a play.
   uint32_t volume_range_db; // the range, in dB, from max dB to min dB. Zero means use the mixer's
                             // native range.
   enum sps_format_t output_format;
   int output_rate;
+
+#ifdef CONFIG_CONVOLUTION
+  int convolution;
+  const char *convolution_ir_file;
+  float convolution_gain;
+  int convolution_max_length;
+#endif
+
+  int loudness;
+  float loudness_reference_volume_db;
+  int alsa_use_playback_switch_for_mute;
+#if defined(HAVE_DBUS)
+  enum dbus_session_type dbus_service_bus_type;
+#endif
+#if defined(HAVE_MPRIS)
+  enum dbus_session_type mpris_service_bus_type;
+#endif
+
 } shairport_cfg;
 
 // true if Shairport Sync is supposed to be sending output to the output device, false otherwise
@@ -160,11 +186,11 @@ void r64arrayinit();
 uint64_t ranarray64u();
 int64_t ranarray64i();
 
-int debuglev;
-void die(char *format, ...);
-void warn(char *format, ...);
-void inform(char *format, ...);
-void debug(int level, char *format, ...);
+extern int debuglev;
+void die(const char *format, ...);
+void warn(const char *format, ...);
+void inform(const char *format, ...);
+void debug(int level, const char *format, ...);
 
 uint8_t *base64_dec(char *input, int *outlen);
 char *base64_enc(uint8_t *input, int length);
@@ -189,15 +215,13 @@ uint32_t uatoi(const char *nptr);
 shairport_cfg config;
 config_t config_file_stuff;
 
-int32_t buffer_occupancy; // allow it to be negative because seq_diff may be negative
-int64_t session_corrections;
-int64_t play_segment_reference_frame;
-uint64_t play_segment_reference_frame_remote_time;
-
 void command_start(void);
 void command_stop(void);
+void command_set_volume(double volume);
 
 void shairport_shutdown();
 // void shairport_startup_complete(void);
+
+extern sigset_t pselect_sigset;
 
 #endif // _COMMON_H
