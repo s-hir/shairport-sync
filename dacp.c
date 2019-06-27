@@ -1,6 +1,6 @@
 /*
  * DACP protocol handler. This file is part of Shairport Sync.
- * Copyright (c) Mike Brady 2017
+ * Copyright (c) Mike Brady 2017 -- 2019
  * All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person
@@ -39,6 +39,7 @@
 #include <netinet/in.h>
 #include <pthread.h>
 #include <stdlib.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -49,15 +50,19 @@ typedef struct {
   int players_connection_thread_index; // the connection thread index when a player thread is
                                        // associated with this, zero otherwise
   int scan_enable;                     // set to 1 if if sacanning should be considered
+  char dacp_id[256];                   // the DACP ID string
   uint16_t port;                       // zero if no port discovered
   short connection_family;             // AF_INET6 or AF_INET
   uint32_t scope_id;                   // if it's an ipv6 connection, this will be its scope id
   char ip_string[INET6_ADDRSTRLEN];    // the ip string pointing to the client
   uint32_t active_remote_id;           // send this when you want to send remote control commands
+  void *port_monitor_private_storage;
 } dacp_server_record;
 
+int dacp_monitor_initialised = 0;
 pthread_t dacp_monitor_thread;
 dacp_server_record dacp_server;
+void *mdns_dacp_monitor_private_storage_pointer;
 
 // HTTP Response data/funcs (See the tinyhttp example.cpp file for more on this.)
 struct HttpResponse {
@@ -67,11 +72,14 @@ struct HttpResponse {
   int code;
 };
 
-static void *response_realloc(__attribute__((unused)) void *opaque, void *ptr, int size) {
-  return realloc(ptr, size);
+void *response_realloc(__attribute__((unused)) void *opaque, void *ptr, int size) {
+  void *t = realloc(ptr, size);
+  if ((t == NULL) && (size != 0))
+    debug(1, "Response realloc of size %d failed!", size);
+  return t;
 }
 
-static void response_body(void *opaque, const char *data, int size) {
+void response_body(void *opaque, const char *data, int size) {
   struct HttpResponse *response = (struct HttpResponse *)opaque;
 
   ssize_t space_available = response->malloced_size - response->size;
@@ -85,8 +93,7 @@ static void response_body(void *opaque, const char *data, int size) {
     if (t)
       response->body = t;
     else {
-      debug(1, "Can't allocate any more space for parser.\n");
-      exit(-1);
+      die("dacp: can't allocate any more space for parser.");
     }
   }
   memcpy(response->body + response->size, data, size);
@@ -108,9 +115,35 @@ static const struct http_funcs responseFuncs = {
     response_realloc, response_body, response_header, response_code,
 };
 
-static pthread_mutex_t dacp_conversation_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t dacp_server_information_lock = PTHREAD_MUTEX_INITIALIZER;
+// static pthread_mutex_t dacp_conversation_lock = PTHREAD_MUTEX_INITIALIZER;
+// static pthread_mutex_t dacp_server_information_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t dacp_conversation_lock;
+static pthread_mutex_t dacp_server_information_lock;
 static pthread_cond_t dacp_server_information_cv = PTHREAD_COND_INITIALIZER;
+
+void addrinfo_cleanup(void *arg) {
+  // debug(1, "addrinfo cleanup called.");
+  struct addrinfo **info = (struct addrinfo **)arg;
+  freeaddrinfo(*info);
+}
+
+void mutex_lock_cleanup(void *arg) {
+  pthread_mutex_t *m = (pthread_mutex_t *)arg;
+  if (pthread_mutex_unlock(m))
+    debug(1, "Error releasing mutex.");
+}
+
+void connect_cleanup(void *arg) {
+  int *fd = (int *)arg;
+  // debug(2, "dacp_send_command: close socket %d.",*fd);
+  close(*fd);
+}
+
+void http_cleanup(void *arg) {
+  // debug(1, "http cleanup called.");
+  struct http_roundtripper *rt = (struct http_roundtripper *)arg;
+  http_free(rt);
+}
 
 int dacp_send_command(const char *command, char **body, ssize_t *bodysize) {
 
@@ -134,14 +167,14 @@ int dacp_send_command(const char *command, char **body, ssize_t *bodysize) {
   response.size = 0;
   response.code = 0;
 
-  char portstring[10], server[256], message[1024];
+  char portstring[10], server[1024], message[1024];
   memset(&portstring, 0, sizeof(portstring));
   if (dacp_server.connection_family == AF_INET6) {
-    sprintf(server, "%s%%%u", dacp_server.ip_string, dacp_server.scope_id);
+    snprintf(server, sizeof(server), "%s%%%u", dacp_server.ip_string, dacp_server.scope_id);
   } else {
     strcpy(server, dacp_server.ip_string);
   }
-  sprintf(portstring, "%u", dacp_server.port);
+  snprintf(portstring, sizeof(portstring), "%u", dacp_server.port);
 
   // first, load up address structs with getaddrinfo():
 
@@ -149,19 +182,21 @@ int dacp_send_command(const char *command, char **body, ssize_t *bodysize) {
   hints.ai_family = AF_UNSPEC;
   hints.ai_socktype = SOCK_STREAM;
 
-  // debug(1, "DHCP port string is \"%s:%s\".", server, portstring);
+  // debug(1, "DACP port string is \"%s:%s\".", server, portstring);
 
   int ires = getaddrinfo(server, portstring, &hints, &res);
   if (ires) {
     // debug(1,"Error %d \"%s\" at getaddrinfo.",ires,gai_strerror(ires));
     response.code = 498; // Bad Address information for the DACP server
   } else {
-
+    uint64_t start_time = get_absolute_time_in_fp();
+    pthread_cleanup_push(addrinfo_cleanup, (void *)&res);
     // only do this one at a time -- not sure it is necessary, but better safe than sorry
 
-    int mutex_reply = ss_pthread_mutex_timedlock(&dacp_conversation_lock, 1000000, command, 1);
+    int mutex_reply = sps_pthread_mutex_timedlock(&dacp_conversation_lock, 2000000, command, 1);
+    // int mutex_reply = pthread_mutex_lock(&dacp_conversation_lock);
     if (mutex_reply == 0) {
-      // debug(1,"dacp_conversation_lock acquired for command \"%s\".",command);
+      pthread_cleanup_push(mutex_lock_cleanup, (void *)&dacp_conversation_lock);
 
       // make a socket:
       sockfd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
@@ -170,43 +205,82 @@ int dacp_send_command(const char *command, char **body, ssize_t *bodysize) {
         // debug(1, "DACP socket could not be created -- error %d: \"%s\".",errno,strerror(errno));
         response.code = 497; // Can't establish a socket to the DACP server
       } else {
+        pthread_cleanup_push(connect_cleanup, (void *)&sockfd);
+        // debug(2, "dacp_send_command: open socket %d.",sockfd);
+
+        struct timeval tv;
+        tv.tv_sec = 0;
+        tv.tv_usec = 80000;
+        if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof tv) == -1)
+          debug(1, "dacp_send_command: error %d setting receive timeout.", errno);
+        if (setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tv, sizeof tv) == -1)
+          debug(1, "dacp_send_command: error %d setting send timeout.", errno);
 
         // connect!
         // debug(1, "DACP socket created.");
         if (connect(sockfd, res->ai_addr, res->ai_addrlen) < 0) {
-          // debug(1, "DACP connect failed.");
+          debug(3, "dacp_send_command: connect failed with errno %d.", errno);
           response.code = 496; // Can't connect to the DACP server
         } else {
           // debug(1,"DACP connect succeeded.");
 
-          sprintf(message,
-                  "GET /ctrl-int/1/%s HTTP/1.1\r\nHost: %s:%u\r\nActive-Remote: %u\r\n\r\n",
-                  command, dacp_server.ip_string, dacp_server.port, dacp_server.active_remote_id);
+          snprintf(message, sizeof(message),
+                   "GET /ctrl-int/1/%s HTTP/1.1\r\nHost: %s:%u\r\nActive-Remote: %u\r\n\r\n",
+                   command, dacp_server.ip_string, dacp_server.port, dacp_server.active_remote_id);
 
           // Send command
-          // debug(1,"DACP connect message: \"%s\".",message);
-          if (send(sockfd, message, strlen(message), 0) != (ssize_t)strlen(message)) {
-            // debug(1, "Send failed");
+          debug(3, "dacp_send_command: \"%s\".", command);
+          ssize_t wresp = send(sockfd, message, strlen(message), 0);
+          if (wresp == -1) {
+            char errorstring[1024];
+            strerror_r(errno, (char *)errorstring, sizeof(errorstring));
+            debug(2, "dacp_send_command: write error %d: \"%s\".", errno, (char *)errorstring);
+            struct linger so_linger;
+            so_linger.l_onoff = 1; // "true"
+            so_linger.l_linger = 0;
+            int err = setsockopt(sockfd, SOL_SOCKET, SO_LINGER, &so_linger, sizeof so_linger);
+            if (err)
+              debug(1, "Could not set the dacp socket to abort due to a write error on closing.");
+          }
+          if (wresp != (ssize_t)strlen(message)) {
+            // debug(1, "dacp_send_command: send failed.");
             response.code = 493; // Client failed to send a message
 
           } else {
 
             response.body = malloc(2048); // it can resize this if necessary
             response.malloced_size = 2048;
+            pthread_cleanup_push(malloc_cleanup, response.body);
 
             struct http_roundtripper rt;
             http_init(&rt, responseFuncs, &response);
+            pthread_cleanup_push(http_cleanup, &rt);
 
             int needmore = 1;
             int looperror = 0;
-            char buffer[1024];
+            char buffer[8192];
             memset(buffer, 0, sizeof(buffer));
             while (needmore && !looperror) {
               const char *data = buffer;
-              int ndata = recv(sockfd, buffer, sizeof(buffer), 0);
-              // debug(1,"Received %d bytes: \"%s\".",ndata,buffer);
+              if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof tv) == -1)
+                debug(1, "dacp_send_command: error %d setting receive timeout.", errno);
+              ssize_t ndata = recv(sockfd, buffer, sizeof(buffer), 0);
+              // debug(3, "Received %d bytes: \"%s\".", ndata, buffer);
               if (ndata <= 0) {
-                debug(1, "Error receiving data.");
+                if (ndata == -1) {
+                  char errorstring[1024];
+                  strerror_r(errno, (char *)errorstring, sizeof(errorstring));
+                  debug(2, "dacp_send_command: receiving error %d: \"%s\".", errno,
+                        (char *)errorstring);
+                  struct linger so_linger;
+                  so_linger.l_onoff = 1; // "true"
+                  so_linger.l_linger = 0;
+                  int err = setsockopt(sockfd, SOL_SOCKET, SO_LINGER, &so_linger, sizeof so_linger);
+                  if (err)
+                    debug(1,
+                          "Could not set the dacp socket to abort due to a read error on closing.");
+                }
+
                 free(response.body);
                 response.body = NULL;
                 response.malloced_size = 0;
@@ -224,26 +298,40 @@ int dacp_send_command(const char *command, char **body, ssize_t *bodysize) {
             }
 
             if (http_iserror(&rt)) {
-              debug(1, "Error parsing data.");
+              debug(3, "dacp_send_command: error parsing data.");
               free(response.body);
               response.body = NULL;
               response.malloced_size = 0;
               response.size = 0;
             }
             // debug(1,"Size of response body is %d",response.size);
-            http_free(&rt);
+            pthread_cleanup_pop(1); // this should call http_cleanup
+            // http_free(&rt);
+            pthread_cleanup_pop(
+                0); // this should *not* free the malloced buffer -- just pop the malloc cleanup
           }
         }
-        close(sockfd);
-        // debug(1,"DACP socket closed.");
+        pthread_cleanup_pop(1); // this should close the socket
+                                // close(sockfd);
+                                // debug(1,"DACP socket closed.");
       }
-      pthread_mutex_unlock(&dacp_conversation_lock);
+      pthread_cleanup_pop(1); // this should unlock the dacp_conversation_lock);
+      // pthread_mutex_unlock(&dacp_conversation_lock);
+      // debug(1,"Sent command\"%s\" with a response body of size %d.",command,response.size);
       // debug(1,"dacp_conversation_lock released.");
     } else {
-      // debug(1, "Could not acquire a lock on the dacp transmit/receive section. Possible
-      // timeout?");
+      debug(3, "dacp_send_command: could not acquire a lock on the dacp transmit/receive section "
+               "when attempting to "
+               "send the command \"%s\". Possible timeout?",
+            command);
       response.code = 494; // This client is already busy
     }
+    pthread_cleanup_pop(1); // this should free the addrinfo
+    // freeaddrinfo(res);
+    uint64_t et = get_absolute_time_in_fp() - start_time;
+    et = (et * 1000000) >> 32; // microseconds
+    debug(3, "dacp_send_command: %f seconds, response code %d, command \"%s\".",
+          (1.0 * et) / 1000000, response.code, command);
   }
   *body = response.body;
   *bodysize = response.size;
@@ -268,47 +356,93 @@ void relinquish_dacp_server_information(rtsp_conn_info *conn) {
   // as the conn's connection number
   // this is to signify that the player has stopped, but only if another thread (with a different
   // index) hasn't already taken over the dacp service
-  ss_pthread_mutex_timedlock(
-      &dacp_server_information_lock, 500000,
-      "set_dacp_server_information couldn't get DACP server information lock in 0.5 second!.", 1);
+  debug_mutex_lock(&dacp_server_information_lock, 500000, 2);
   if (dacp_server.players_connection_thread_index == conn->connection_number)
     dacp_server.players_connection_thread_index = 0;
-  pthread_mutex_unlock(&dacp_server_information_lock);
+  debug_mutex_unlock(&dacp_server_information_lock, 3);
 }
 
 // this will be running on the thread of its caller, not of the conversation thread...
-void set_dacp_server_information(rtsp_conn_info *conn) { // tell the DACP conversation thread that
-                                                         // the port has been set or changed
-  ss_pthread_mutex_timedlock(
-      &dacp_server_information_lock, 500000,
-      "set_dacp_server_information couldn't get DACP server information lock in 0.5 second!.", 1);
+// tell the DACP conversation thread what DACP server we are listening to
+// if the active_remote_id is the same we don't change anything apart from
+// the conversation number
+// Thus, we can keep the DACP port that might have previously been discovered
+void set_dacp_server_information(rtsp_conn_info *conn) {
+  // debug(1, "set_dacp_server_information");
+  debug_mutex_lock(&dacp_server_information_lock, 500000, 2);
   dacp_server.players_connection_thread_index = conn->connection_number;
-  dacp_server.port = conn->dacp_port;
-  dacp_server.connection_family = conn->connection_ip_family;
-  dacp_server.scope_id = conn->self_scope_id;
-  strncpy(dacp_server.ip_string, conn->client_ip_string, INET6_ADDRSTRLEN);
-  dacp_server.active_remote_id = conn->dacp_active_remote;
-  if (dacp_server.port)
-    dacp_server.scan_enable = 1;
-  else
+
+  if ((conn->dacp_id == NULL) || (strcmp(conn->dacp_id, dacp_server.dacp_id) != 0)) {
+    if (conn->dacp_id)
+      strncpy(dacp_server.dacp_id, conn->dacp_id, sizeof(dacp_server.dacp_id) - 1);
+    else
+      dacp_server.dacp_id[0] = '\0';
+    dacp_server.port = 0;
     dacp_server.scan_enable = 0;
-  metadata_hub_modify_prolog();
-  int ch = metadata_store.dacp_server_active != dacp_server.scan_enable;
-  metadata_store.dacp_server_active = dacp_server.scan_enable;
+    dacp_server.connection_family = conn->connection_ip_family;
+    dacp_server.scope_id = conn->self_scope_id;
+    strncpy(dacp_server.ip_string, conn->client_ip_string, INET6_ADDRSTRLEN);
+    debug(3, "set_dacp_server_information set IP to \"%s\" and DACP id to \"%s\".",
+          dacp_server.ip_string, dacp_server.dacp_id);
 
-  if ((metadata_store.client_ip == NULL) ||
-      (strncmp(metadata_store.client_ip, conn->client_ip_string, INET6_ADDRSTRLEN) != 0)) {
-    if (metadata_store.client_ip)
-      free(metadata_store.client_ip);
-    metadata_store.client_ip = strndup(conn->client_ip_string, INET6_ADDRSTRLEN);
-    debug(1, "MH Client IP set to: \"%s\"", metadata_store.client_ip);
-    metadata_store.client_ip_changed = 1;
-    metadata_store.changed = 1;
-    ch = 1;
+    mdns_dacp_monitor_set_id(dacp_server.dacp_id);
+
+    metadata_hub_modify_prolog();
+    int ch = metadata_store.dacp_server_active != dacp_server.scan_enable;
+    metadata_store.dacp_server_active = dacp_server.scan_enable;
+    if ((metadata_store.client_ip == NULL) ||
+        (strncmp(metadata_store.client_ip, conn->client_ip_string, INET6_ADDRSTRLEN) != 0)) {
+      if (metadata_store.client_ip)
+        free(metadata_store.client_ip);
+      metadata_store.client_ip = strndup(conn->client_ip_string, INET6_ADDRSTRLEN);
+      debug(3, "MH Client IP set to: \"%s\"", metadata_store.client_ip);
+      ch = 1;
+    }
+    metadata_hub_modify_epilog(ch);
+  } else {
+    if (dacp_server.port) {
+      // debug(1, "Re-enable scanning.");
+      dacp_server.scan_enable = 1;
+      //      metadata_hub_modify_prolog();
+      //      int ch = metadata_store.dacp_server_active != dacp_server.scan_enable;
+      //      metadata_store.dacp_server_active = dacp_server.scan_enable;
+      //      metadata_hub_modify_epilog(ch);
+    }
   }
-  metadata_hub_modify_epilog(ch);
-
+  dacp_server.active_remote_id = conn->dacp_active_remote; // even if the dacp_id remains the same,
+                                                           // the active remote will change.
+  debug(3, "set_dacp_server_information set active-remote id to %" PRIu32 ".",
+        dacp_server.active_remote_id);
   pthread_cond_signal(&dacp_server_information_cv);
+  debug_mutex_unlock(&dacp_server_information_lock, 3);
+}
+
+void dacp_monitor_port_update_callback(char *dacp_id, uint16_t port) {
+  debug_mutex_lock(&dacp_server_information_lock, 500000, 2);
+  debug(3, "dacp_monitor_port_update_callback with Remote ID \"%s\", target ID \"%s\" and port "
+           "number %d.",
+        dacp_id, dacp_server.dacp_id, port);
+  if (strcmp(dacp_id, dacp_server.dacp_id) == 0) {
+    dacp_server.port = port;
+    if (port == 0)
+      dacp_server.scan_enable = 0;
+    else {
+      dacp_server.scan_enable = 1;
+      // debug(2, "dacp_monitor_port_update_callback enables scan");
+    }
+    //    metadata_hub_modify_prolog();
+    //    int ch = metadata_store.dacp_server_active != dacp_server.scan_enable;
+    //    metadata_store.dacp_server_active = dacp_server.scan_enable;
+    //    metadata_hub_modify_epilog(ch);
+  } else {
+    debug(1, "dacp port monitor reporting on an out-of-use remote.");
+  }
+  pthread_cond_signal(&dacp_server_information_cv);
+  debug_mutex_unlock(&dacp_server_information_lock, 3);
+}
+
+void dacp_monitor_thread_code_cleanup(__attribute__((unused)) void *arg) {
+  // debug(1, "dacp_monitor_thread_code_cleanup called.");
   pthread_mutex_unlock(&dacp_server_information_lock);
 }
 
@@ -318,350 +452,449 @@ void *dacp_monitor_thread_code(__attribute__((unused)) void *na) {
   // debug(1, "DACP monitor thread started.");
   // wait until we get a valid port number to begin monitoring it
   int32_t revision_number = 1;
+  int bad_result_count = 0;
+  int idle_scan_count = 0;
   while (1) {
-    int result;
-    ss_pthread_mutex_timedlock(
+    int result = 0;
+    sps_pthread_mutex_timedlock(
         &dacp_server_information_lock, 500000,
-        "dacp_monitor_thread_code couldn't get DACP server information lock in 0.5 second!.", 1);
-    while (dacp_server.scan_enable == 0) {
-      // debug(1, "Wait for a valid DACP port");
-      pthread_cond_wait(&dacp_server_information_cv, &dacp_server_information_lock);
+        "dacp_monitor_thread_code couldn't get DACP server information lock in 0.5 second!.", 2);
+    int32_t the_volume;
+
+    pthread_cleanup_push(dacp_monitor_thread_code_cleanup, NULL);
+    if (dacp_server.scan_enable == 0) {
+      metadata_hub_modify_prolog();
+      int ch = (metadata_store.dacp_server_active != 0) ||
+               (metadata_store.advanced_dacp_server_active != 0);
+      metadata_store.dacp_server_active = 0;
+      metadata_store.advanced_dacp_server_active = 0;
+      debug(2, "setting dacp_server_active and advanced_dacp_server_active to 0 with an update "
+               "flag value of %d",
+            ch);
+      metadata_hub_modify_epilog(ch);
+      while (dacp_server.scan_enable == 0) {
+        // debug(1, "dacp_monitor_thread_code wait for an event to possible enable scan");
+        pthread_cond_wait(&dacp_server_information_cv, &dacp_server_information_lock);
+        //      debug(1,"dacp_monitor_thread_code wake up.");
+      }
+      bad_result_count = 0;
+      idle_scan_count = 0;
     }
     scan_index++;
-    int32_t the_volume;
     result = dacp_get_volume(&the_volume); // just want the http code
+
     if ((result == 496) || (result == 403) || (result == 501)) {
-      // debug(1,"Stopping scan because the response to \"dacp_get_volume(NULL)\" is %d.",result);
+      bad_result_count++;
+      // debug(1,"Bad Scan : %d.",result);
+    } else
+      bad_result_count = 0;
+
+    if (metadata_store.player_thread_active == 0)
+      idle_scan_count++;
+    else
+      idle_scan_count = 0;
+
+    debug(3, "Scan Result: %d, Bad Scan Count: %d, Idle Scan Count: %d.", result, bad_result_count,
+          idle_scan_count);
+
+    if ((bad_result_count == config.scan_max_bad_response_count) ||
+        (idle_scan_count == config.scan_max_inactive_count)) {
+      debug(2, "DACP server status scanning stopped.");
       dacp_server.scan_enable = 0;
-      metadata_hub_modify_prolog();
-      int ch = metadata_store.dacp_server_active != 0;
-      metadata_store.dacp_server_active = 0;
-      metadata_hub_modify_epilog(ch);
     }
-    pthread_mutex_unlock(&dacp_server_information_lock);
+    pthread_cleanup_pop(1);
+
+    // pthread_mutex_unlock(&dacp_server_information_lock);
     // debug(1, "DACP Server ID \"%u\" at \"%s:%u\", scan %d.", dacp_server.active_remote_id,
     //      dacp_server.ip_string, dacp_server.port, scan_index);
 
-    int adv = (result == 200);
-    // a result of 200 means the advanced features of, e.g., iTunes, are available
-    // so, turn the advanced_dacp_server flag on or off and flag if it's changed.
-    metadata_hub_modify_prolog();
-    int diff = metadata_store.advanced_dacp_server_active != adv;
-    if (diff)
-      metadata_store.advanced_dacp_server_active = adv;
-    metadata_hub_modify_epilog(diff);
+    if (dacp_server.scan_enable ==
+        1) { // if it hasn't been turned off, continue looking for information.
+      int transient_problem =
+          (result == 494) ||
+          (result == 495); // this just means that it couldn't send the query because something
+                           // else
+                           // was sending a command or something
+      if ((!transient_problem) && (bad_result_count == 0) && (idle_scan_count == 0) &&
+          (dacp_server.scan_enable == 1)) {
 
-    if (result == 200) {
+        // Any other result means that the DACP server is active, but not providing advanced
+        // features
 
-      metadata_hub_modify_prolog();
-      int diff = metadata_store.speaker_volume != the_volume;
-      if (diff)
-        metadata_store.speaker_volume = the_volume;
-      metadata_hub_modify_epilog(diff);
-
-      ssize_t le;
-      char *response = NULL;
-      int32_t item_size;
-      char command[1024] = "";
-      snprintf(command, sizeof(command) - 1, "playstatusupdate?revision-number=%d",
-               revision_number);
-      // debug(1,"Command: \"%s\"",command);
-      result = dacp_send_command(command, &response, &le);
-      // debug(1,"Response to \"%s\" is %d.",command,result);
-      if (result == 200) {
-        // if (0) {
-        char *sp = response;
-        if (le >= 8) {
-          // here start looking for the contents of the status update
-          if (dacp_tlv_crawl(&sp, &item_size) == 'cmst') { // status
-            // here, we know that we are receiving playerstatusupdates, so set a flag
-            metadata_hub_modify_prolog();
-            // debug(1, "playstatusupdate release track metadata");
-            // metadata_hub_reset_track_metadata();
-            // metadata_store.playerstatusupdates_are_received = 1;
-            sp -= item_size; // drop down into the array -- don't skip over it
-            le -= 8;
-            // char typestring[5];
-            // we need to acquire the metadata data structure and possibly update it
-            while (le >= 8) {
-              uint32_t type = dacp_tlv_crawl(&sp, &item_size);
-              le -= item_size + 8;
-              char *t;
-              // char u;
-              // char *st;
-              int32_t r;
-              // uint64_t v;
-              // int i;
-
-              switch (type) {
-              case 'cmsr': // revision number
-                t = sp - item_size;
-                revision_number = ntohl(*(uint32_t *)(t));
-                // debug(1,"    Serial Number: %d", revision_number);
-                break;
-              case 'caps': // play status
-                t = sp - item_size;
-                r = *(unsigned char *)(t);
-                switch (r) {
-                case 2:
-                  if (metadata_store.play_status != PS_STOPPED) {
-                    metadata_store.play_status = PS_STOPPED;
-                    metadata_store.play_status_changed = 1;
-                    debug(1, "Play status changed to \"stopped\".");
-                    metadata_store.changed = 1;
-                  }
-                  break;
-                case 3:
-                  if (metadata_store.play_status != PS_PAUSED) {
-                    metadata_store.play_status = PS_PAUSED;
-                    metadata_store.play_status_changed = 1;
-                    debug(1, "Play status changed to \"paused\".");
-                    metadata_store.changed = 1;
-                  }
-                  break;
-                case 4:
-                  if (metadata_store.play_status != PS_PLAYING) {
-                    metadata_store.play_status = PS_PLAYING;
-                    metadata_store.play_status_changed = 1;
-                    debug(1, "Play status changed to \"playing\".");
-                    metadata_store.changed = 1;
-                  }
-                  break;
-                default:
-                  debug(1, "Unrecognised play status %d received.", r);
-                  break;
-                }
-                break;
-              case 'cash': // shuffle status
-                t = sp - item_size;
-                r = *(unsigned char *)(t);
-                switch (r) {
-                case 0:
-                  if (metadata_store.shuffle_status != SS_OFF) {
-                    metadata_store.shuffle_status = SS_OFF;
-                    metadata_store.shuffle_status_changed = 1;
-                    debug(1, "Shuffle status changed to \"off\".");
-                    metadata_store.changed = 1;
-                  }
-                  break;
-                case 1:
-                  if (metadata_store.shuffle_status != SS_ON) {
-                    metadata_store.shuffle_status = SS_ON;
-                    metadata_store.shuffle_status_changed = 1;
-                    debug(1, "Shuffle status changed to \"on\".");
-                    metadata_store.changed = 1;
-                  }
-                  break;
-                default:
-                  debug(1, "Unrecognised shuffle status %d received.", r);
-                  break;
-                }
-                break;
-              case 'carp': // repeat status
-                t = sp - item_size;
-                r = *(unsigned char *)(t);
-                switch (r) {
-                case 0:
-                  if (metadata_store.repeat_status != RS_OFF) {
-                    metadata_store.repeat_status = RS_OFF;
-                    metadata_store.repeat_status_changed = 1;
-                    debug(1, "Repeat status changed to \"none\".");
-                    metadata_store.changed = 1;
-                  }
-                  break;
-                case 1:
-                  if (metadata_store.repeat_status != RS_ONE) {
-                    metadata_store.repeat_status = RS_ONE;
-                    metadata_store.repeat_status_changed = 1;
-                    debug(1, "Repeat status changed to \"one\".");
-                    metadata_store.changed = 1;
-                  }
-                  break;
-                case 2:
-                  if (metadata_store.repeat_status != RS_ALL) {
-                    metadata_store.repeat_status = RS_ALL;
-                    metadata_store.repeat_status_changed = 1;
-                    debug(1, "Repeat status changed to \"all\".");
-                    metadata_store.changed = 1;
-                  }
-                  break;
-                default:
-                  debug(1, "Unrecognised repeat status %d received.", r);
-                  break;
-                }
-                break;
-              /*
-              case 'cann': // track name
-                t = sp - item_size;
-                if ((metadata_store.track_name == NULL) ||
-                    (strncmp(metadata_store.track_name, t, item_size) != 0)) {
-                  if (metadata_store.track_name)
-                    free(metadata_store.track_name);
-                  metadata_store.track_name = strndup(t, item_size);
-                  debug(1, "Track name changed to: \"%s\"", metadata_store.track_name);
-                  metadata_store.track_name_changed = 1;
-                  metadata_store.changed = 1;
-                }
-                break;
-              case 'cana': // artist name
-                t = sp - item_size;
-                if ((metadata_store.artist_name == NULL) ||
-                    (strncmp(metadata_store.artist_name, t, item_size) != 0)) {
-                  if (metadata_store.artist_name)
-                    free(metadata_store.artist_name);
-                  metadata_store.artist_name = strndup(t, item_size);
-                  debug(1, "Artist name changed to: \"%s\"", metadata_store.artist_name);
-                  metadata_store.artist_name_changed = 1;
-                  metadata_store.changed = 1;
-                }
-                break;
-              case 'canl': // album name
-                t = sp - item_size;
-                if ((metadata_store.album_name == NULL) ||
-                    (strncmp(metadata_store.album_name, t, item_size) != 0)) {
-                  if (metadata_store.album_name)
-                    free(metadata_store.album_name);
-                  metadata_store.album_name = strndup(t, item_size);
-                  debug(1, "Album name changed to: \"%s\"", metadata_store.album_name);
-                  metadata_store.album_name_changed = 1;
-                  metadata_store.changed = 1;
-                }
-                break;
-              case 'cang': // genre
-                t = sp - item_size;
-                if ((metadata_store.genre == NULL) ||
-                    (strncmp(metadata_store.genre, t, item_size) != 0)) {
-                  if (metadata_store.genre)
-                    free(metadata_store.genre);
-                  metadata_store.genre = strndup(t, item_size);
-                  debug(1, "Genre changed to: \"%s\"", metadata_store.genre);
-                  metadata_store.genre_changed = 1;
-                  metadata_store.changed = 1;
-                }
-                break;
-              case 'canp': // nowplaying 4 ids: dbid, plid, playlistItem, itemid (from mellowware --
-                           // see reference above)
-                t = sp - item_size;
-                if (memcmp(metadata_store.item_composite_id, t,
-                           sizeof(metadata_store.item_composite_id)) != 0) {
-                  memcpy(metadata_store.item_composite_id, t,
-                         sizeof(metadata_store.item_composite_id));
-
-                  char st[33];
-                  char *pt = st;
-                  int it;
-                  for (it = 0; it < 16; it++) {
-                    sprintf(pt, "%02X", metadata_store.item_composite_id[it]);
-                    pt += 2;
-                  }
-                  *pt = 0;
-                  // debug(1, "Item composite ID set to 0x%s.", st);
-                  metadata_store.item_id_changed = 1;
-                  metadata_store.changed = 1;
-                }
-                break;
-              */
-              case 'astm':
-                t = sp - item_size;
-                r = ntohl(*(uint32_t *)(t));
-                metadata_store.songtime_in_milliseconds = ntohl(*(uint32_t *)(t));
-                break;
-
-              /*
-                          case 'mstt':
-                          case 'cant':
-                          case 'cast':
-                          case 'cmmk':
-                          case 'caas':
-                          case 'caar':
-                            t = sp - item_size;
-                            r = ntohl(*(uint32_t *)(t));
-                            printf("    %d", r);
-                            printf("    (0x");
-                            t = sp - item_size;
-                            for (i = 0; i < item_size; i++) {
-                              printf("%02x", *t & 0xff);
-                              t++;
-                            }
-                            printf(")");
-                            break;
-                          case 'asai':
-                            t = sp - item_size;
-                            s = ntohl(*(uint32_t *)(t));
-                            s = s << 32;
-                            t += 4;
-                            v = (ntohl(*(uint32_t *)(t))) & 0xffffffff;
-                            s += v;
-                            printf("    %lu", s);
-                            printf("    (0x");
-                            t = sp - item_size;
-                            for (i = 0; i < item_size; i++) {
-                              printf("%02x", *t & 0xff);
-                              t++;
-                            }
-                            printf(")");
-                            break;
-               */
-              default:
-                /*
-                  printf("    0x");
-                  t = sp - item_size;
-                  for (i = 0; i < item_size; i++) {
-                    printf("%02x", *t & 0xff);
-                    t++;
-                  }
-                 */
-                break;
-              }
-              // printf("\n");
-            }
-
-            // finished possibly writing to the metadata hub
-            metadata_hub_modify_epilog(1);
-          } else {
-            debug(1, "Status Update not found.\n");
-          }
-        } else {
-          debug(1, "Can't find any content in playerstatusupdate request");
+        metadata_hub_modify_prolog();
+        int inactive = metadata_store.dacp_server_active == 0;
+        if (inactive) {
+          metadata_store.dacp_server_active = 1;
+          debug(2, "Setting dacp_server_active to active because of a response of %d.", result);
         }
-      } /* else {
-        if (result != 403)
-          debug(1, "Unexpected response %d to playerstatusupdate request", result);
-      } */
+        int same = metadata_store.advanced_dacp_server_active == (result == 200);
+        if (!same) {
+          metadata_store.advanced_dacp_server_active = (result == 200);
+          debug(2, "Setting dacp_advanced_server_active to %d because of a response of %d.",
+                (result == 200), result);
+        }
+        metadata_hub_modify_epilog(inactive + (!same));
+      }
+
+      if (result == 200) {
+        metadata_hub_modify_prolog();
+        int diff = metadata_store.speaker_volume != the_volume;
+        if (diff)
+          metadata_store.speaker_volume = the_volume;
+        metadata_hub_modify_epilog(diff);
+
+        ssize_t le;
+        char *response = NULL;
+        int32_t item_size;
+        char command[1024] = "";
+        snprintf(command, sizeof(command) - 1, "playstatusupdate?revision-number=%d",
+                 revision_number);
+        // debug(1,"Command: \"%s\"",command);
+        result = dacp_send_command(command, &response, &le);
+        // debug(1,"Response to \"%s\" is %d.",command,result);
+        if (result == 200) {
+          // if (0) {
+          char *sp = response;
+          if (le >= 8) {
+            // here start looking for the contents of the status update
+            if (dacp_tlv_crawl(&sp, &item_size) == 'cmst') { // status
+              // here, we know that we are receiving playerstatusupdates, so set a flag
+              metadata_hub_modify_prolog();
+              // debug(1, "playstatusupdate release track metadata");
+              // metadata_hub_reset_track_metadata();
+              // metadata_store.playerstatusupdates_are_received = 1;
+              sp -= item_size; // drop down into the array -- don't skip over it
+              le -= 8;
+              // char typestring[5];
+              // we need to acquire the metadata data structure and possibly update it
+              while (le >= 8) {
+                uint32_t type = dacp_tlv_crawl(&sp, &item_size);
+                le -= item_size + 8;
+                char *t;
+                // char u;
+                // char *st;
+                int32_t r;
+                // uint64_t v;
+                // int i;
+
+                switch (type) {
+                case 'cmsr': // revision number
+                  t = sp - item_size;
+                  revision_number = ntohl(*(uint32_t *)(t));
+                  // debug(1,"    Serial Number: %d", revision_number);
+                  break;
+                case 'caps': // play status
+                  t = sp - item_size;
+                  r = *(unsigned char *)(t);
+                  switch (r) {
+                  case 2:
+                    if (metadata_store.play_status != PS_STOPPED) {
+                      metadata_store.play_status = PS_STOPPED;
+                      debug(2, "Play status is \"stopped\".");
+                    }
+                    break;
+                  case 3:
+                    if (metadata_store.play_status != PS_PAUSED) {
+                      metadata_store.play_status = PS_PAUSED;
+                      debug(2, "Play status is \"paused\".");
+                    }
+                    break;
+                  case 4:
+                    if (metadata_store.play_status != PS_PLAYING) {
+                      metadata_store.play_status = PS_PLAYING;
+                      debug(2, "Play status changed to \"playing\".");
+                    }
+                    break;
+                  default:
+                    debug(1, "Unrecognised play status %d received.", r);
+                    break;
+                  }
+                  break;
+                case 'cash': // shuffle status
+                  t = sp - item_size;
+                  r = *(unsigned char *)(t);
+                  switch (r) {
+                  case 0:
+                    if (metadata_store.shuffle_status != SS_OFF) {
+                      metadata_store.shuffle_status = SS_OFF;
+                      debug(2, "Shuffle status is \"off\".");
+                    }
+                    break;
+                  case 1:
+                    if (metadata_store.shuffle_status != SS_ON) {
+                      metadata_store.shuffle_status = SS_ON;
+                      debug(2, "Shuffle status is \"on\".");
+                    }
+                    break;
+                  default:
+                    debug(1, "Unrecognised shuffle status %d received.", r);
+                    break;
+                  }
+                  break;
+                case 'carp': // repeat status
+                  t = sp - item_size;
+                  r = *(unsigned char *)(t);
+                  switch (r) {
+                  case 0:
+                    if (metadata_store.repeat_status != RS_OFF) {
+                      metadata_store.repeat_status = RS_OFF;
+                      debug(2, "Repeat status is \"none\".");
+                    }
+                    break;
+                  case 1:
+                    if (metadata_store.repeat_status != RS_ONE) {
+                      metadata_store.repeat_status = RS_ONE;
+                      debug(2, "Repeat status is \"one\".");
+                    }
+                    break;
+                  case 2:
+                    if (metadata_store.repeat_status != RS_ALL) {
+                      metadata_store.repeat_status = RS_ALL;
+                      debug(2, "Repeat status is \"all\".");
+                    }
+                    break;
+                  default:
+                    debug(1, "Unrecognised repeat status %d received.", r);
+                    break;
+                  }
+                  break;
+                /*
+                case 'cann': // track name
+                  t = sp - item_size;
+                  if ((metadata_store.track_name == NULL) ||
+                      (strncmp(metadata_store.track_name, t, item_size) != 0)) {
+                    if (metadata_store.track_name)
+                      free(metadata_store.track_name);
+                    metadata_store.track_name = strndup(t, item_size);
+                    debug(1, "Track name changed to: \"%s\"", metadata_store.track_name);
+                    metadata_store.track_name_changed = 1;
+                    metadata_store.changed = 1;
+                  }
+                  break;
+                case 'cana': // artist name
+                  t = sp - item_size;
+                  if ((metadata_store.artist_name == NULL) ||
+                      (strncmp(metadata_store.artist_name, t, item_size) != 0)) {
+                    if (metadata_store.artist_name)
+                      free(metadata_store.artist_name);
+                    metadata_store.artist_name = strndup(t, item_size);
+                    debug(1, "Artist name changed to: \"%s\"", metadata_store.artist_name);
+                    metadata_store.artist_name_changed = 1;
+                    metadata_store.changed = 1;
+                  }
+                  break;
+                case 'canl': // album name
+                  t = sp - item_size;
+                  if ((metadata_store.album_name == NULL) ||
+                      (strncmp(metadata_store.album_name, t, item_size) != 0)) {
+                    if (metadata_store.album_name)
+                      free(metadata_store.album_name);
+                    metadata_store.album_name = strndup(t, item_size);
+                    debug(1, "Album name changed to: \"%s\"", metadata_store.album_name);
+                    metadata_store.album_name_changed = 1;
+                    metadata_store.changed = 1;
+                  }
+                  break;
+                case 'cang': // genre
+                  t = sp - item_size;
+                  if ((metadata_store.genre == NULL) ||
+                      (strncmp(metadata_store.genre, t, item_size) != 0)) {
+                    if (metadata_store.genre)
+                      free(metadata_store.genre);
+                    metadata_store.genre = strndup(t, item_size);
+                    debug(1, "Genre changed to: \"%s\"", metadata_store.genre);
+                    metadata_store.genre_changed = 1;
+                    metadata_store.changed = 1;
+                  }
+                  break;
+                case 'canp': // nowplaying 4 ids: dbid, plid, playlistItem, itemid (from mellowware
+                --
+                             // see reference above)
+                  t = sp - item_size;
+                  if (memcmp(metadata_store.item_composite_id, t,
+                             sizeof(metadata_store.item_composite_id)) != 0) {
+                    memcpy(metadata_store.item_composite_id, t,
+                           sizeof(metadata_store.item_composite_id));
+
+                    char st[33];
+                    char *pt = st;
+                    int it;
+                    for (it = 0; it < 16; it++) {
+                      snprintf(pt, 3, "%02X", metadata_store.item_composite_id[it]);
+                      pt += 2;
+                    }
+                    *pt = 0;
+                    // debug(1, "Item composite ID set to 0x%s.", st);
+                    metadata_store.item_id_changed = 1;
+                    metadata_store.changed = 1;
+                  }
+                  break;
+                */
+                case 'astm':
+                  t = sp - item_size;
+                  r = ntohl(*(uint32_t *)(t));
+                  if (metadata_store.track_metadata)
+                    metadata_store.track_metadata->songtime_in_milliseconds =
+                        ntohl(*(uint32_t *)(t));
+                  break;
+
+                /*
+                            case 'mstt':
+                            case 'cant':
+                            case 'cast':
+                            case 'cmmk':
+                            case 'caas':
+                            case 'caar':
+                              t = sp - item_size;
+                              r = ntohl(*(uint32_t *)(t));
+                              printf("    %d", r);
+                              printf("    (0x");
+                              t = sp - item_size;
+                              for (i = 0; i < item_size; i++) {
+                                printf("%02x", *t & 0xff);
+                                t++;
+                              }
+                              printf(")");
+                              break;
+                            case 'asai':
+                              t = sp - item_size;
+                              s = ntohl(*(uint32_t *)(t));
+                              s = s << 32;
+                              t += 4;
+                              v = (ntohl(*(uint32_t *)(t))) & 0xffffffff;
+                              s += v;
+                              printf("    %lu", s);
+                              printf("    (0x");
+                              t = sp - item_size;
+                              for (i = 0; i < item_size; i++) {
+                                printf("%02x", *t & 0xff);
+                                t++;
+                              }
+                              printf(")");
+                              break;
+                 */
+                default:
+                  /*
+                    printf("    0x");
+                    t = sp - item_size;
+                    for (i = 0; i < item_size; i++) {
+                      printf("%02x", *t & 0xff);
+                      t++;
+                    }
+                   */
+                  break;
+                }
+                // printf("\n");
+              }
+
+              // finished possibly writing to the metadata hub
+              metadata_hub_modify_epilog(1);
+            } else {
+              debug(1, "Status Update not found.\n");
+            }
+          } else {
+            debug(1, "Can't find any content in playerstatusupdate request");
+          }
+        } /* else {
+          if (result != 403)
+            debug(1, "Unexpected response %d to playerstatusupdate request", result);
+        } */
+        if (response) {
+          free(response);
+          response = NULL;
+        };
+      };
+      /*
+      strcpy(command,"nowplayingartwork?mw=320&mh=320");
+      debug(1,"Command: \"%s\", result is %d",command, dacp_send_command(command, &response, &le));
       if (response) {
         free(response);
         response = NULL;
-      };
-    };
-    /*
-    strcpy(command,"nowplayingartwork?mw=320&mh=320");
-    debug(1,"Command: \"%s\", result is %d",command, dacp_send_command(command, &response, &le));
-    if (response) {
-      free(response);
-      response = NULL;
+      }
+      strcpy(command,"getproperty?properties=dmcp.volume");
+      debug(1,"Command: \"%s\", result is %d",command, dacp_send_command(command, &response, &le));
+      if (response) {
+        free(response);
+        response = NULL;
+      }
+      strcpy(command,"setproperty?dmcp.volume=100.000000");
+      debug(1,"Command: \"%s\", result is %d",command, dacp_send_command(command, &response, &le));
+      if (response) {
+        free(response);
+        response = NULL;
+      }
+      */
+      if (metadata_store.player_thread_active)
+        sleep(config.scan_interval_when_active);
+      else
+        sleep(config.scan_interval_when_inactive);
     }
-    strcpy(command,"getproperty?properties=dmcp.volume");
-    debug(1,"Command: \"%s\", result is %d",command, dacp_send_command(command, &response, &le));
-    if (response) {
-      free(response);
-      response = NULL;
-    }
-    strcpy(command,"setproperty?dmcp.volume=100.000000");
-    debug(1,"Command: \"%s\", result is %d",command, dacp_send_command(command, &response, &le));
-    if (response) {
-      free(response);
-      response = NULL;
-    }
-    */
-    sleep(5); // check every five seconds
   }
-  debug(1, "DACP monitor thread exiting.");
+  debug(1, "DACP monitor thread exiting -- should never happen.");
   pthread_exit(NULL);
 }
 
 void dacp_monitor_start() {
+  int rc;
+  pthread_mutexattr_t mta;
+
+  rc = pthread_mutexattr_init(&mta);
+  if (rc)
+    debug(1, "Error creating the DACP Conversation Lock Mutex Att Init");
+
+  rc = pthread_mutexattr_settype(&mta, PTHREAD_MUTEX_ERRORCHECK);
+  if (rc)
+    debug(1, "Error creating the DACP Conversation Lock Mutex Errorcheck");
+
+  // rc = pthread_mutexattr_setname_np(&mta, "DACP Conversation Lock");
+  // if (rc)
+  //  debug(1,"Error creating the DACP Conversation Lock Mutex Set Name");
+
+  rc = pthread_mutex_init(&dacp_conversation_lock, &mta);
+  if (rc)
+    debug(1, "Error creating the DACP Conversation Lock Mutex Init");
+  // else
+  //  debug(1, "DACP Conversation Lock Mutex Init");
+
+  rc = pthread_mutexattr_destroy(&mta);
+  if (rc)
+    debug(1, "Error creating the DACP Conversation Lock Attr Destroy");
+
+  rc = pthread_mutexattr_init(&mta);
+  if (rc)
+    debug(1, "Error creating the DACP Server Information Lock Mutex Att Init");
+
+  rc = pthread_mutexattr_settype(&mta, PTHREAD_MUTEX_ERRORCHECK);
+  if (rc)
+    debug(1, "Error creating the DACP Server Information Lock Mutex Errorcheck");
+
+  // rc = pthread_mutexattr_setname_np(&mta, "DACP Conversation Lock");
+  // if (rc)
+  //  debug(1,"Error creating the DACP Server Information Lock Mutex Set Name");
+
+  rc = pthread_mutex_init(&dacp_server_information_lock, &mta);
+  if (rc)
+    debug(1, "Error creating the DACP Server Information Lock Mutex Init");
+
+  rc = pthread_mutexattr_destroy(&mta);
+  if (rc)
+    debug(1, "Error creating the DACP Server Information Lock Attr Destroy");
+
   memset(&dacp_server, 0, sizeof(dacp_server_record));
+
   pthread_create(&dacp_monitor_thread, NULL, dacp_monitor_thread_code, NULL);
+  dacp_monitor_initialised = 1;
+}
+
+void dacp_monitor_stop() {
+  if (dacp_monitor_initialised) { // only if it's been started and initialised
+    debug(2, "dacp_monitor_stop");
+    pthread_cancel(dacp_monitor_thread);
+    pthread_join(dacp_monitor_thread, NULL);
+    pthread_mutex_destroy(&dacp_server_information_lock);
+    debug(3, "DACP Conversation Lock Mutex Destroyed");
+    pthread_mutex_destroy(&dacp_conversation_lock);
+  }
 }
 
 uint32_t dacp_tlv_crawl(char **p, int32_t *length) {
@@ -705,10 +938,14 @@ int dacp_get_client_volume(int32_t *result) {
       debug(1, "Too short a response from getproperty?properties=dmcp.volume");
     }
     // debug(1, "Overall Volume is %d.", overall_volume);
+  }
+
+  if (server_reply) {
+    // debug(1, "Freeing response memory.");
     free(server_reply);
-  } /* else {
-    debug(1, "Unexpected response %d to dacp volume control request", response);
-  } */
+    server_reply = NULL;
+  }
+
   if (result) {
     *result = overall_volume;
     // debug(1,"dacp_get_client_volume returns: %" PRId32 ".",overall_volume);
@@ -720,8 +957,9 @@ int dacp_set_include_speaker_volume(int64_t machine_number, int32_t vo) {
   debug(2, "dacp_set_include_speaker_volume to %" PRId32 ".", vo);
   char message[1000];
   memset(message, 0, sizeof(message));
-  sprintf(message, "setproperty?include-speaker-id=%" PRId64 "&dmcp.volume=%" PRId32 "",
-          machine_number, vo);
+  snprintf(message, sizeof(message),
+           "setproperty?include-speaker-id=%" PRId64 "&dmcp.volume=%" PRId32 "", machine_number,
+           vo);
   debug(2, "sending \"%s\"", message);
   return send_simple_dacp_command(message);
   // should return 204
@@ -730,8 +968,8 @@ int dacp_set_include_speaker_volume(int64_t machine_number, int32_t vo) {
 int dacp_set_speaker_volume(int64_t machine_number, int32_t vo) {
   char message[1000];
   memset(message, 0, sizeof(message));
-  sprintf(message, "setproperty?speaker-id=%" PRId64 "&dmcp.volume=%" PRId32 "", machine_number,
-          vo);
+  snprintf(message, sizeof(message), "setproperty?speaker-id=%" PRId64 "&dmcp.volume=%" PRId32 "",
+           machine_number, vo);
   debug(2, "sending \"%s\"", message);
   return send_simple_dacp_command(message);
   // should return 204
@@ -761,12 +999,13 @@ int dacp_get_speaker_list(dacp_spkr_stuff *speaker_info, int max_size_of_array,
             sp -= item_size;
             le -= 8;
             speaker_index++;
-            if (speaker_index == max_size_of_array)
+            if (speaker_index == max_size_of_array) {
               return 413; // Payload Too Large -- too many speakers
+            }
             speaker_info[speaker_index].active = 0;
             speaker_info[speaker_index].speaker_number = 0;
             speaker_info[speaker_index].volume = 0;
-            speaker_info[speaker_index].name = NULL;
+            speaker_info[speaker_index].name[0] = '\0';
           } else {
             le -= item_size + 8;
             char *t;
@@ -776,8 +1015,10 @@ int dacp_get_speaker_list(dacp_spkr_stuff *speaker_info, int max_size_of_array,
             switch (type) {
             case 'minm':
               t = sp - item_size;
-              speaker_info[speaker_index].name = strndup(t, item_size);
-              // debug(1," \"%s\"",speaker_info[speaker_index].name);
+              strncpy((char *)&speaker_info[speaker_index].name, t,
+                      sizeof(speaker_info[speaker_index].name));
+              speaker_info[speaker_index].name[sizeof(speaker_info[speaker_index].name) - 1] =
+                  '\0'; // just in case
               break;
             case 'cmvo':
               t = sp - item_size;
@@ -842,7 +1083,12 @@ int dacp_get_speaker_list(dacp_spkr_stuff *speaker_info, int max_size_of_array,
     free(server_reply);
     server_reply = NULL;
   } else {
-    debug(1, "Unexpected response %d to dacp speakers request", response);
+    // debug(1, "Unexpected response %d to dacp speakers request", response);
+    if (server_reply) {
+      debug(1, "Freeing response memory.");
+      free(server_reply);
+      server_reply = NULL;
+    }
   }
   if (actual_speaker_count)
     *actual_speaker_count = speaker_count;

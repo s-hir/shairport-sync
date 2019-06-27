@@ -12,6 +12,11 @@ enum play_status_type {
   PS_PLAYING,
 } play_status_type;
 
+enum active_state_type {
+  AM_INACTIVE = 0,
+  AM_ACTIVE,
+} active_state_type;
+
 enum shuffle_status_type {
   SS_NOT_AVAILABLE = 0,
   SS_OFF,
@@ -25,81 +30,62 @@ enum repeat_status_type {
   RS_ALL,
 } repeat_status_type;
 
+typedef struct track_metadata_bundle {
+  uint32_t item_id;     // seems to be a track ID -- see itemid in DACP.c
+  int item_id_received; // important for deciding if the track information should be ignored.
+  unsigned char
+      item_composite_id[16]; // seems to be nowplaying 4 ids: dbid, plid, playlistItem, itemid
+  char *track_name;          // a malloced string -- if non-zero, free it before replacing it
+  char *artist_name;         // a malloced string -- if non-zero, free it before replacing it
+  char *album_artist_name;   // a malloced string -- if non-zero, free it before replacing it
+  char *album_name;          // a malloced string -- if non-zero, free it before replacing it
+  char *genre;               // a malloced string -- if non-zero, free it before replacing it
+  char *comment;             // a malloced string -- if non-zero, free it before replacing it
+  char *composer;            // a malloced string -- if non-zero, free it before replacing it
+  char *file_kind;           // a malloced string -- if non-zero, free it before replacing it
+  char *song_description;    // a malloced string -- if non-zero, free it before replacing it
+  char *song_album_artist;   // a malloced string -- if non-zero, free it before replacing it
+  char *sort_name;           // a malloced string -- if non-zero, free it before replacing it
+  char *sort_artist;         // a malloced string -- if non-zero, free it before replacing it
+  char *sort_album;          // a malloced string -- if non-zero, free it before replacing it
+  char *sort_composer;       // a malloced string -- if non-zero, free it before replacing it
+  uint32_t songtime_in_milliseconds;
+} track_metadata_bundle;
+
 struct metadata_bundle;
 
 typedef void (*metadata_watcher)(struct metadata_bundle *argc, void *userdata);
 
 typedef struct metadata_bundle {
 
-  int dacp_server_active; // true if there's a reachable DACP server (assumed to be the Airplay
-                          // client) ; false otherwise
+  char *client_ip; // IP number used by the audio source (i.e. the "client"), which is also the DACP
+                   // server
+  char *server_ip; // IP number used by Shairport Sync
+  char *progress_string;    // progress string, emitted by the source from time to time
+  int player_thread_active; // true if a play thread is running
+  int dacp_server_active;   // true if there's a reachable DACP server (assumed to be the Airplay
+                            // client) ; false otherwise
   int advanced_dacp_server_active; // true if there's a reachable DACP server with iTunes
                                    // capabilitiues
                                    // ; false otherwise
-
-  int changed;                          // normally 0, nonzero if a field has been changed
-  int playerstatusupdates_are_received; // false if it's "traditional" metadata
-
-  int player_thread_active; // true if there is a player threrad; false otherwise
-
+  int dacp_server_has_been_active; // basically this is a delayed version of dacp_server_active,
+  // used detect transitions between server activity being on or off
+  // e.g. to reease metadata when a server goes inactive, but not if it's permanently
+  // inactive.
   enum play_status_type play_status;
-  int play_status_changed;
-
   enum shuffle_status_type shuffle_status;
-  int shuffle_status_changed;
-
   enum repeat_status_type repeat_status;
-  int repeat_status_changed;
 
-  char *track_name; // a malloced string -- if non-zero, free it before replacing it
-  int track_name_changed;
-
-  char *artist_name; // a malloced string -- if non-zero, free it before replacing it
-  int artist_name_changed;
-
-  char *album_name; // a malloced string -- if non-zero, free it before replacing it
-  int album_name_changed;
-
-  char *genre; // a malloced string -- if non-zero, free it before replacing it
-  int genre_changed;
-
-  char *comment; // a malloced string -- if non-zero, free it before replacing it
-  int comment_changed;
-
-  char *composer; // a malloced string -- if non-zero, free it before replacing it
-  int composer_changed;
-
-  char *file_kind; // a malloced string -- if non-zero, free it before replacing it
-  int file_kind_changed;
-
-  char *sort_as; // a malloced string -- if non-zero, free it before replacing it
-  int sort_as_changed;
-
-  char *client_ip; // IP number used by the audio source (i.e. the "client"), which is also the DACP
-                   // server
-  int client_ip_changed;
-
-  char *server_ip; // IP number used by Shairport Sync
-
-  uint32_t item_id; // seems to be a track ID -- see itemid in DACP.c
-  int item_id_changed;
-
-  uint32_t songtime_in_milliseconds;
-
-  unsigned char
-      item_composite_id[16]; // seems to be nowplaying 4 ids: dbid, plid, playlistItem, itemid
+  struct track_metadata_bundle *track_metadata;
 
   char *cover_art_pathname; // if non-zero, it will have been assigned with malloc.
 
-  //
-
   enum play_status_type
       player_state; // this is the state of the actual player itself, which can be a bit noisy.
+  enum active_state_type active_state;
 
   int speaker_volume; // this is the actual speaker volume, allowing for the main volume and the
                       // speaker volume control
-  // int previous_speaker_volume; // this is needed to prevent a loop
-
   int airplay_volume;
 
   metadata_watcher watchers[number_of_watchers]; // functions to call if the metadata is changed.
@@ -112,6 +98,7 @@ struct metadata_bundle metadata_store;
 void add_metadata_watcher(metadata_watcher fn, void *userdata);
 
 void metadata_hub_init(void);
+void metadata_hub_stop(void);
 void metadata_hub_process_metadata(uint32_t type, uint32_t code, char *data, uint32_t length);
 void metadata_hub_reset_track_metadata(void);
 void metadata_hub_release_track_artwork(void);

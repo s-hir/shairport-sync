@@ -34,27 +34,32 @@
 
 #ifdef CONFIG_AVAHI
 extern mdns_backend mdns_avahi;
-extern mdns_backend mdns_external_avahi;
 #endif
-#ifdef CONFIG_HAVE_DNS_SD_H
+#ifdef CONFIG_DNS_SD
 extern mdns_backend mdns_dns_sd;
-extern mdns_backend mdns_external_dns_sd;
 #endif
 #ifdef CONFIG_TINYSVCMDNS
 extern mdns_backend mdns_tinysvcmdns;
 #endif
 
+#ifdef CONFIG_EXTERNAL_MDNS
+extern mdns_backend mdns_external_avahi;
+extern mdns_backend mdns_external_dns_sd;
+#endif
+
 static mdns_backend *mdns_backends[] = {
 #ifdef CONFIG_AVAHI
     &mdns_avahi,
-    &mdns_external_avahi,
 #endif
-#ifdef CONFIG_HAVE_DNS_SD_H
+#ifdef CONFIG_DNS_SD
     &mdns_dns_sd,
-    &mdns_external_dns_sd,
 #endif
 #ifdef CONFIG_TINYSVCMDNS
     &mdns_tinysvcmdns,
+#endif
+#ifdef CONFIG_EXTERNAL_MDNS
+    &mdns_external_avahi,
+    &mdns_external_dns_sd,
 #endif
     NULL};
 
@@ -63,7 +68,7 @@ void mdns_register(void) {
   char *p = mdns_service_name;
   int i;
   for (i = 0; i < 6; i++) {
-    sprintf(p, "%02X", config.hw_addr[i]);
+    snprintf(p, 3, "%02X", config.hw_addr[i]);
     p += 2;
   }
   *p++ = '@';
@@ -96,30 +101,38 @@ void mdns_register(void) {
 
   if (config.mdns == NULL)
     die("Could not establish mDNS advertisement!");
+
+  mdns_dacp_monitor_start(); // create a dacp monitor thread
 }
 
 void mdns_unregister(void) {
+  mdns_dacp_monitor_stop();
   if (config.mdns) {
     config.mdns->mdns_unregister();
   }
 }
 
-void mdns_dacp_monitor(rtsp_conn_info *conn) {
-  if ((config.mdns) && (config.mdns->mdns_dacp_monitor)) {
-    int error = config.mdns->mdns_dacp_monitor(conn);
-    if (error) {
-      debug(1, "Error starting a DACP monitor.");
-    }
+void mdns_dacp_monitor_start(void) {
+  if ((config.mdns) && (config.mdns->mdns_dacp_monitor_start)) {
+    config.mdns->mdns_dacp_monitor_start();
   } else
-    debug(1, "Can't start a DACP monitor.");
+    debug(3, "Can't start a DACP monitor -- no mdns_dacp_monitor start registered.");
 }
 
-void mdns_dacp_dont_monitor(rtsp_conn_info *conn) {
-  if ((config.mdns) && (config.mdns->mdns_dacp_dont_monitor)) {
-    config.mdns->mdns_dacp_dont_monitor(conn);
+void mdns_dacp_monitor_stop() {
+  if ((config.mdns) && (config.mdns->mdns_dacp_monitor_stop)) {
+    config.mdns->mdns_dacp_monitor_stop();
   } else
-    debug(1, "Can't stop a DACP monitor.");
+    debug(3, "Can't stop a DACP monitor -- no mdns_dacp_monitor_stop registered.");
 }
+
+void mdns_dacp_monitor_set_id(const char *dacp_id) {
+  if ((config.mdns) && (config.mdns->mdns_dacp_monitor_set_id)) {
+    config.mdns->mdns_dacp_monitor_set_id(dacp_id);
+  } else
+    debug(3, "Can't set dacp_id -- no mdns_dacp_set_id registered.");
+}
+
 void mdns_ls_backends(void) {
   mdns_backend **b = NULL;
   printf("Available mDNS backends: \n");

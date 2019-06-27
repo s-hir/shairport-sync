@@ -1,5 +1,5 @@
 Name:           shairport-sync
-Version:        3.1.2
+Version:        3.3.1
 Release:        1%{?dist}
 Summary:        AirTunes emulator. Multi-Room with Audio Synchronisation
 # MIT licensed except for tinysvcmdns under BSD, 
@@ -14,7 +14,6 @@ BuildRequires:  systemd
 BuildRequires:  pkgconfig(libconfig)
 BuildRequires:  pkgconfig(popt)
 BuildRequires:  pkgconfig(openssl)
-BuildRequires:  pkgconfig(libdaemon)
 BuildRequires:  pkgconfig(avahi-core)
 BuildRequires:  pkgconfig(alsa)
 BuildRequires:  pkgconfig(soxr)
@@ -67,6 +66,21 @@ getent passwd %{name} &> /dev/null || useradd --system -c "%{name} User" \
 %license LICENSES
 
 %changelog
+* Wed Jun 05 2019 Mike Brady <mikebrady@eircom.net) 3.3.1
+- Bug fixes.
+* Fri May 24 2019 Mike Brady <mikebrady@eircom.net) 3.3
+- Audio enhancements, stability improvements, MQTT and Jack Audio interfaces.
+* Sun Oct 14 2018 Mike Brady <mikebrady@eircom.net) 3.2.2
+- Compatibility with iOS 12 and mac OS Mojave AirPlay latencies. Minor bug fix.
+* Fri Jul 13 2018 Mike Brady <mikebrady@eircom.net) 3.2.1
+- Stability improvements when soxr interpolation is chosen.
+* Mon Jul 09 2018 Mike Brady <mikebrady@eircom.net) 3.2
+- New D-Bus and MPRIS Interfaces, Bug Fixes and Enhancements.
+* Thu Dec 21 2017 Mike Brady <mikebrady@eircom.net> 3.1.7
+- Bug fix for unexpectedly resuming play at full volume from iOS 11.2 and macOS 10.3.2.
+* Mon Dec 11 2017 Mike Brady <mikebrady@eircom.net> 3.1.5
+- Bug fixes and better compatability with iOS 11.2 and mac OS 10.13.2.
+- Better AirPlay synchronisation.
 * Wed Sep 13 2017 Bill Peck <bpeck@redhat.com> 3.1.2-1
 - New upstream release
 - The default value for the alsa setting mute_using_playback_switch has

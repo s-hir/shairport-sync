@@ -91,8 +91,7 @@ void mpris_metadata_watcher(struct metadata_bundle *argc, __attribute__((unused)
   // Make up the artwork URI if we have one
   if (argc->cover_art_pathname) {
     char artURIstring[1024];
-    sprintf(artURIstring, "file://%s", argc->cover_art_pathname);
-    // sprintf(artURIstring,"");
+    snprintf(artURIstring, sizeof(artURIstring), "file://%s", argc->cover_art_pathname);
     // debug(1,"artURI String: \"%s\".",artURIstring);
     GVariant *artUrl = g_variant_new("s", artURIstring);
     g_variant_builder_add(dict_builder, "{sv}", "mpris:artUrl", artUrl);
@@ -105,30 +104,34 @@ void mpris_metadata_watcher(struct metadata_bundle *argc, __attribute__((unused)
   char *pt = st;
   int it;
   int non_zero = 0;
-  for (it = 0; it < 16; it++) {
-    if (argc->item_composite_id[it])
-      non_zero = 1;
-    sprintf(pt, "%02X", argc->item_composite_id[it]);
-    pt += 2;
+  if (argc->track_metadata) {
+    for (it = 0; it < 16; it++) {
+      if (argc->track_metadata->item_composite_id[it])
+        non_zero = 1;
+      snprintf(pt, 3, "%02X", argc->track_metadata->item_composite_id[it]);
+      pt += 2;
+    }
   }
   *pt = 0;
+
   if (non_zero) {
     // debug(1, "Set ID using composite ID: \"0x%s\".", st);
     char trackidstring[1024];
-    sprintf(trackidstring, "/org/gnome/ShairportSync/%s", st);
+    snprintf(trackidstring, sizeof(trackidstring), "/org/gnome/ShairportSync/%s", st);
     GVariant *trackid = g_variant_new("o", trackidstring);
     g_variant_builder_add(dict_builder, "{sv}", "mpris:trackid", trackid);
-  } else if (argc->item_id) {
+  } else if ((argc->track_metadata) && (argc->track_metadata->item_id)) {
     char trackidstring[128];
     // debug(1, "Set ID using mper ID: \"%u\".",argc->item_id);
-    sprintf(trackidstring, "/org/gnome/ShairportSync/mper_%u", argc->item_id);
+    snprintf(trackidstring, sizeof(trackidstring), "/org/gnome/ShairportSync/mper_%u",
+             argc->track_metadata->item_id);
     GVariant *trackid = g_variant_new("o", trackidstring);
     g_variant_builder_add(dict_builder, "{sv}", "mpris:trackid", trackid);
   }
 
   // Add the track length if it's non-zero
-  if (argc->songtime_in_milliseconds) {
-    uint64_t track_length_in_microseconds = argc->songtime_in_milliseconds;
+  if ((argc->track_metadata) && (argc->track_metadata->songtime_in_milliseconds)) {
+    uint64_t track_length_in_microseconds = argc->track_metadata->songtime_in_milliseconds;
     track_length_in_microseconds *= 1000; // to microseconds in 64-bit precision
                                           // Make up the track name and album name
     // debug(1, "Set tracklength to %lu.", track_length_in_microseconds);
@@ -137,35 +140,35 @@ void mpris_metadata_watcher(struct metadata_bundle *argc, __attribute__((unused)
   }
 
   // Add the track name if there is one
-  if (argc->track_name) {
+  if ((argc->track_metadata) && (argc->track_metadata->track_name)) {
     // debug(1, "Track name set to \"%s\".", argc->track_name);
-    GVariant *trackname = g_variant_new("s", argc->track_name);
+    GVariant *trackname = g_variant_new("s", argc->track_metadata->track_name);
     g_variant_builder_add(dict_builder, "{sv}", "xesam:title", trackname);
   }
 
   // Add the album name if there is one
-  if (argc->album_name) {
+  if ((argc->track_metadata) && (argc->track_metadata->album_name)) {
     // debug(1, "Album name set to \"%s\".", argc->album_name);
-    GVariant *albumname = g_variant_new("s", argc->album_name);
+    GVariant *albumname = g_variant_new("s", argc->track_metadata->album_name);
     g_variant_builder_add(dict_builder, "{sv}", "xesam:album", albumname);
   }
 
   // Add the artists if there are any (actually there will be at most one, but put it in an array)
-  if (argc->artist_name) {
+  if ((argc->track_metadata) && (argc->track_metadata->artist_name)) {
     /* Build the artists array */
     // debug(1,"Build artist array");
     aa = g_variant_builder_new(G_VARIANT_TYPE("as"));
-    g_variant_builder_add(aa, "s", argc->artist_name);
+    g_variant_builder_add(aa, "s", argc->track_metadata->artist_name);
     GVariant *artists = g_variant_builder_end(aa);
     g_variant_builder_unref(aa);
     g_variant_builder_add(dict_builder, "{sv}", "xesam:artist", artists);
   }
 
   // Add the genres if there are any (actually there will be at most one, but put it in an array)
-  if (argc->genre) {
+  if ((argc->track_metadata) && (argc->track_metadata->genre)) {
     // debug(1,"Build genre");
     aa = g_variant_builder_new(G_VARIANT_TYPE("as"));
-    g_variant_builder_add(aa, "s", argc->genre);
+    g_variant_builder_add(aa, "s", argc->track_metadata->genre);
     GVariant *genres = g_variant_builder_end(aa);
     g_variant_builder_unref(aa);
     g_variant_builder_add(dict_builder, "{sv}", "xesam:genre", genres);
@@ -178,6 +181,14 @@ void mpris_metadata_watcher(struct metadata_bundle *argc, __attribute__((unused)
   media_player2_player_set_metadata(mprisPlayerPlayerSkeleton, dict);
 
   // media_player2_player_set_volume(mprisPlayerPlayerSkeleton, metadata_store.speaker_volume);
+}
+
+static gboolean on_handle_quit(MediaPlayer2 *skeleton, GDBusMethodInvocation *invocation,
+                               __attribute__((unused)) gpointer user_data) {
+  debug(1, "quit requested (MPRIS interface).");
+  pthread_cancel(main_thread_id);
+  media_player2_complete_quit(skeleton, invocation);
+  return TRUE;
 }
 
 static gboolean on_handle_next(MediaPlayer2Player *skeleton, GDBusMethodInvocation *invocation,
@@ -240,7 +251,7 @@ static void on_mpris_name_acquired(GDBusConnection *connection, const gchar *nam
 
   media_player2_set_desktop_entry(mprisPlayerSkeleton, "shairport-sync");
   media_player2_set_identity(mprisPlayerSkeleton, "Shairport Sync");
-  media_player2_set_can_quit(mprisPlayerSkeleton, FALSE);
+  media_player2_set_can_quit(mprisPlayerSkeleton, TRUE);
   media_player2_set_can_raise(mprisPlayerSkeleton, FALSE);
   media_player2_set_has_track_list(mprisPlayerSkeleton, FALSE);
   media_player2_set_supported_uri_schemes(mprisPlayerSkeleton, empty_string_array);
@@ -257,6 +268,8 @@ static void on_mpris_name_acquired(GDBusConnection *connection, const gchar *nam
   media_player2_player_set_can_pause(mprisPlayerPlayerSkeleton, TRUE);
   media_player2_player_set_can_seek(mprisPlayerPlayerSkeleton, FALSE);
   media_player2_player_set_can_control(mprisPlayerPlayerSkeleton, TRUE);
+
+  g_signal_connect(mprisPlayerSkeleton, "handle-quit", G_CALLBACK(on_handle_quit), NULL);
 
   g_signal_connect(mprisPlayerPlayerSkeleton, "handle-play", G_CALLBACK(on_handle_play), NULL);
   g_signal_connect(mprisPlayerPlayerSkeleton, "handle-pause", G_CALLBACK(on_handle_pause), NULL);
@@ -289,7 +302,7 @@ static void on_mpris_name_lost(__attribute__((unused)) GDBusConnection *connecti
   //      name,(mpris_bus_type==G_BUS_TYPE_SESSION) ? "session" : "system");
   pid_t pid = getpid();
   char interface_name[256] = "";
-  sprintf(interface_name, "org.mpris.MediaPlayer2.ShairportSync.i%d", pid);
+  snprintf(interface_name, sizeof(interface_name), "org.mpris.MediaPlayer2.ShairportSync.i%d", pid);
   GBusType mpris_bus_type = G_BUS_TYPE_SYSTEM;
   if (config.mpris_service_bus_type == DBT_session)
     mpris_bus_type = G_BUS_TYPE_SESSION;

@@ -25,6 +25,8 @@ Otherwise – say if you deleted the repository – just pull Shairport Sync fro
 $ git clone https://github.com/mikebrady/shairport-sync.git
 $ cd shairport-sync
 ```
+(If you wish to use the `development` branch, you should enter the command `$ git checkout development` at this point. Everything else is the same.)
+
 Now, while in the `shairport-sync` directory, perform the following commands (note that there is a choice you must make in there):
 ```
 $ autoreconf -fi
@@ -35,7 +37,7 @@ Please review the release notes to see if any configuration settings have been c
 $ ./configure --with-alsa --with-avahi --with-ssl=openssl --with-metadata --with-soxr --with-systemd --sysconfdir=/etc
 #OR
 #The following is the standard configuration for a Linux that uses the alsa backend and the older System V initialisation system:
-$ ./configure --with-alsa --with-avahi --with-ssl=openssl --with-metadata --with-soxr --with-systemv --sysconfdir=/etc
+$ ./configure --with-libdaemon --with-alsa --with-avahi --with-ssl=openssl --with-metadata --with-soxr --with-systemv --sysconfdir=/etc
 
 $ make
 $ sudo make install
@@ -55,7 +57,7 @@ $ sudo service shairport-sync restart
 Your Shairport Sync should be upgraded now. 
 
 ### Post Update Tasks
-1 **Unmute the Output Device Mixer** (This applies only if you are using a hardware mixer for volume control.) Certain older versions of Shairport Sync could leave the output device mixer in a muted state after use to minimuse the possibility of noise. However, this is not generally compatible with other audio players using the same device, as they would generally expect the device to be unmuted. Recent versions of Shairport Sync therefore do not use the mute facility by default. When you update Shairport Sync, the output device mixer might have been muted by the previous version, so you should unmute it, using, for instance, the following command:
+1 **Unmute the Output Device Mixer** (This applies only if you are using a hardware mixer for volume control.) Certain older versions of Shairport Sync could leave the output device mixer in a muted state after use to minimise the possibility of noise. However, this is not generally compatible with other audio players using the same device, as they would generally expect the device to be unmuted. Recent versions of Shairport Sync therefore do not use the mute facility by default. When you update Shairport Sync, the output device mixer might have been muted by the previous version, so you should unmute it, using, for instance, the following command:
 ```
 $ sudo amixer sset <mixer_name> unmute
 ```
